@@ -1,0 +1,29 @@
+{
+    "argv": [
+        "python",
+        "C:/Users/Sam/Documents/College/SemesterProject/ProjectRepo/Semester-Project-Jupyter-Kernel/my_kernel.py",
+        "{connection_file}"
+    ],
+    "display_name": "JuliaPythonKernel",
+    "language": "python",
+    "protocol_version": "5.3",
+    "implementation": "JuliaPythonKernel",
+    "implementation_version": "0.1.0",
+    "language_info": {
+        "name": "julia and python",
+        "mimetype": "text/x-python",
+        "file_extension": ".ipynb",
+        "pygments_lexer": "python3",
+         "codemirror_mode": {
+            "name": "ipython",
+            "version": 3
+        }
+    },
+    "banner": "JuliaPythonKernel - A Jupyter kernel for executing Julia and Python code.",
+        "help_links": [
+        {
+            "text": "MyJuliaKernel Documentation",
+            "url": "https://github.com/samuel98t/Semester-Project-Jupyter-Kernel"
+        }
+    ]
+}

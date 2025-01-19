@@ -7,7 +7,13 @@ import threading
 import hmac
 import hashlib
 import datetime
+import juliacall
 from juliacall import Main as jl
+from juliacall import Base as jlbase
+import io
+import traceback
+
+
 
 
 # read_connection_file is a function that takes a filepath to the connection file,
@@ -40,7 +46,8 @@ class Kernel:
         # Initialize execution count
         self.execution_count = 0
         # Initialize PyJulia
-        jl.seval('using InteractiveUtils')  # Initialize InteractiveUtils
+        jl.seval('using InteractiveUtils')
+
 
     
 
@@ -77,35 +84,43 @@ class Kernel:
     # makes sure the message was not tampered with
     def validate_signature(self, message_parts):
         if len(message_parts) < 6:
-            print("Error: Incomplete message for signature validation")
             return False
-        delimiter = message_parts[0]
-        received_signature = message_parts[1]
-        # Convert the recived signature from hex to bytes
-        received_signature_bytes = bytes.fromhex(received_signature.decode())
-        # Get the key from connection info and make sure its in bytes.
+        received_signature_str = message_parts[1].decode()
+        if received_signature_str.startswith("sha256="):
+            received_signature_str = received_signature_str[len("sha256="):]  # strip prefix
+
+        try:
+            received_signature_bytes = bytes.fromhex(received_signature_str)
+        except ValueError:
+            return False
+
+        # Our connection key from the JSON file, ensure it's bytes
         key = self.connection_info["key"]
         if isinstance(key, str):
             key = key.encode("utf-8")
-        # Create then Update the hmac object with the parts except delimiter and signature
+
+        # Prepare an HMAC object
         h = hmac.new(key, digestmod=hashlib.sha256)
-        for part in message_parts[2:]:  # Start from index 2 to skip delimiter and signature
+
+        # Update HMAC with the signable parts: header, parent_header, metadata, content
+        for part in message_parts[2:]:
             h.update(part)
-        # Compare the expected signature with the one in the message ,
-        # If matching message is secure
+
+        # Compare
         expected_signature = h.digest()
         if hmac.compare_digest(expected_signature, received_signature_bytes):
             return True
         else:
-            print("Error: Invalid signature")
             return False
 
+            
     # Recieves the message from the specified channel and
     # cuts it in to the relevant parts to handle it 
     # accordingly to its type
     def handle_message(self,socket_name,socket):
         message = socket.recv_multipart()
-        print(f"Raw message received on {socket_name}: {message}")  # Keep the debugging print
+        # DEBUGGING
+        print(f"Raw message received on {socket_name}: {message}")  
         zmq_identities = message[:-6]  # The ZMQ identities are all parts *before* the last 6 (delimiter, signature, headers, content)
         delimiter = message[-6]
         signature = message[-5]
@@ -195,7 +210,17 @@ class Kernel:
     # Here all the code execution magic should happen, taking the code, identifying language,
     # executing it, sending back responses if theres a need, or output/errors etc...
     def handle_execute_request(self, socket_name, socket, header, parent_header, metadata, content, zmq_identities):
+        self.send_iopub_status("busy",header)
         code = content['code']
+        self.execution_count += 1 # increment the exectution count
+
+        # send response
+        input_content = {
+            'code': code,
+            'execution_count': self.execution_count,
+        }
+        self.send_response('iopub', None, 'execute_input', input_content, parent_header=header)
+
         # Language detection using magics
         lines = code.split('\n')
         line_1 = lines[0].strip()
@@ -210,53 +235,120 @@ class Kernel:
             language = "python"
             code_to_exec = code
             # DEBUGGING
-            print(f"Detected language: {language}")
-            print(f"Code to execute: {code_to_exec}")
-                # Execute the code and handle errors
-        try:
-            if language == 'python':
-                exec(code_to_exec)
-                reply_content = {
-                    'status': 'ok',
-                    'execution_count': self.execution_count,
-                    'user_expressions': {},
-                }
-            elif language == 'julia':
-                # Julia execution using PYJulia
+        print(f"Detected language: {language}")
+        print(f"Code to execute: {code_to_exec}")
+        # Execute the code and handle errors
+
+        # Prepare to catch output/errors
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        output = ""
+        error_output = ""
+
+        # Try to execute code according to the selected language.
+        try :
+            if language == "julia":
+                return
+            elif language == "python":
+                sys.stdout = captured_stdout
+                sys.stderr = captured_stderr
                 try:
-                    jl.eval(code_to_exec)
-                    reply_content = {
-                        'status': 'ok',
-                        'execution_count': self.execution_count,
-                        'user_expressions': {},
-                    }
-                except Exception as e:
-                    reply_content = {
-                        'status': 'error',
-                        'execution_count': self.execution_count,
-                        'ename': type(e).__name__,
-                        'evalue': str(e),
-                        'traceback': [],
-                    }
-                    self.send_response("iopub", self.iopub_socket, "error", reply_content, parent_header=header, zmq_identities=zmq_identities)
+                    exec(code_to_exec,globals(),locals())
+                except Exception:
+                    error_output = traceback.format_exc()
+                    output = ""
+                finally:
+                    # Restore for python aswell
+                    sys.stdout = old_stdout
+                    sys.stderr = old_stderr
+            output = captured_stdout.getvalue()
+            error_output = captured_stderr.getvalue()
 
-            self.execution_count += 1
 
-        # If there was an error during exectuion then send error message.
         except Exception as e:
-            reply_content = {
-                'status': 'error',
-                'execution_count': self.execution_count,
-                'ename': type(e).__name__,
-                'evalue': str(e),
-                'traceback': [str(e)],
+        # General exception handling 
+            error_output = traceback.format_exc()
+            output = ""
+        finally:
+            # restore always after
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+        
+        # Publish output (if theres any)
+            if output:
+               output_content = {
+                'output_type': 'stream',
+                'name': 'stdout',
+                'text': output,
+               }
+               self.send_response('iopub', None, 'stream', output_content, parent_header=header)
+        # Publish error output (if theres any)
+            if error_output:
+                error_content = {
+                'output_type': 'stream',
+                'name': 'stderr',
+                'text': error_output,
             }
+                self.send_response('iopub', None, 'stream', error_content, parent_header=header)
+            
+            # Send execute result on shell channel
+            execute_reply_content = {
+                'status': 'ok' if not error_output else 'error',
+                'execution_count': self.execution_count,
+                'payload': [],  # List of display data.
+                'user_expressions': {},
+            }
+           
+            if error_output:
+                execute_reply_content['ename'] = 'Error'
+                execute_reply_content['evalue'] = str(error_output).splitlines()[-1]
+                execute_reply_content['traceback'] = str(error_output).splitlines()
+            
+            self.send_response(socket_name, socket, 'execute_reply', execute_reply_content, parent_header=header, zmq_identities=zmq_identities)
+            self.send_iopub_status("idle",header)
 
-        # Send the reply
-        self.send_response(socket_name, socket, 'execute_reply', reply_content, parent_header=header, zmq_identities=zmq_identities)
+
+    # This sends busy/idle status
+    def send_iopub_status(self, status_string, parent_header):
+        content = {'execution_state': status_string }
+        self.send_response('iopub',None,'status',content,parent_header=parent_header)
+
+    # this handles unimportant message requests and thier replies.
+    def handle_extra_messages(self, socket_name, socket, header, parent_header, metadata, content, zmq_identities):
+        msg_type = header["msg_type"]
+
+        # Send "busy" status 
+        self.send_iopub_status("busy", header)
+        if msg_type == "history_request":
+            reply_content = {"history": []}
+            self.send_response(socket_name, socket, "history_reply", reply_content,parent_header=header,zmq_identities=zmq_identities)
+
+        elif msg_type == "comm_info_request":
+            # Must reply with comm_info_reply
+            reply_content = {"comms": {}}
+            self.send_response(socket_name, socket, "comm_info_reply", reply_content,parent_header=header,zmq_identities=zmq_identities)
+
+        elif msg_type in ("comm_open", "comm_msg", "comm_close"):
+            pass
+
+        else:
+        # Catch any other extra messages 
+            print(f"Warning: Unhandled extra msg_type: {msg_type}")
+
+        # Send "idle" status 
+        self.send_iopub_status("idle", header)       
+
+
+            
 
     # Function to handle info request 
     def handle_kernel_info_request(self, socket_name, socket, header, zmq_identities):
+        # Send busy to iopub
+        self.send_iopub_status("busy", header)
+        self.send_response('iopub',None,'status',{'execution_state': 'busy'},parent_header=header)
         # DEBUGGING
         print("Handling kernel_info_request...")
         print(f"Socket name: {socket_name}")
@@ -268,7 +360,7 @@ class Kernel:
             'implementation_version': '0.1.0', 
             'language_info': {
                 'name': 'julia and python',
-                'version': jl.eval('VERSION') if hasattr(jl, 'eval') else sys.version.split()[0] ,
+                'version': str(jl.eval('VERSION')) if hasattr(jl, 'eval') else sys.version.split()[0] ,
                 'mimetype': 'text/x-python',
                 'file_extension': '.ipynb',
                 'pygments_lexer': 'python3',
@@ -280,8 +372,10 @@ class Kernel:
             ]
         }
         # DEBUGGING
-        print("Sending kernel_info_reply...")
+        print("Sending kernel_info_reply...",zmq_identities)
         self.send_response(socket_name, socket, 'kernel_info_reply', reply_content, parent_header=header, zmq_identities=zmq_identities)
+        # Send Idle response 
+        self.send_iopub_status("idle", header)
 
 
 
@@ -322,7 +416,7 @@ class Kernel:
 
 if __name__ == "__main__":
         
-    connection_file_path="connection.json"
+    connection_file_path = sys.argv[1]
     # Create the kernel
     kernel = Kernel(connection_file_path)
     # Start the kernel's main loop
