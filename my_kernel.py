@@ -12,6 +12,9 @@ from juliacall import Main as jl
 from juliacall import Base as jlbase
 import io
 import traceback
+import time
+import builtins
+
 
 
 
@@ -39,6 +42,9 @@ class Kernel:
         self.connection_file = connection_file
         self.connection_info = read_connection_file(connection_file)
         self.context = zmq.Context()
+        self.waiting_for_input = False
+        self._input_result = ""
+
         # Setup the sockets.
         self.shell_socket, self.iopub_socket, self.stdin_socket, self.control_socket, self.hb_socket = self.setup_sockets()
         # Setup the id.
@@ -47,6 +53,7 @@ class Kernel:
         self.execution_count = 0
         # Initialize PyJulia
         jl.seval('using InteractiveUtils')
+        jl.seval('using IOCapture')
 
 
     
@@ -149,6 +156,20 @@ class Kernel:
         # Deal with kernel info request message
         elif msg_type == 'kernel_info_request':
             self.handle_kernel_info_request(socket_name, socket, header, zmq_identities)
+        elif msg_type == 'input_reply':
+            self.handle_input_reply(content)
+
+        else:
+        # Send all other message types to handle_extra_messages:
+            self.handle_extra_messages(
+            socket_name, 
+            socket, 
+            header, 
+            parent_header, 
+            metadata, 
+            content, 
+            zmq_identities
+        )
 
 
     def sign_message(self, header_str, parent_header_str, metadata_str, content_str):
@@ -206,7 +227,8 @@ class Kernel:
         else:
             socket_obj.send_multipart(parts)
 
-    
+
+
     # Here all the code execution magic should happen, taking the code, identifying language,
     # executing it, sending back responses if theres a need, or output/errors etc...
     def handle_execute_request(self, socket_name, socket, header, parent_header, metadata, content, zmq_identities):
@@ -251,29 +273,66 @@ class Kernel:
         # Try to execute code according to the selected language.
         try :
             if language == "julia":
-                return
+                # Set up Julia output capture
+                jl.seval("""
+                using IOCapture
+    
+                function capture_eval(code)
+                    captured = IOCapture.capture() do
+                        eval(Meta.parse(code))
+                    end
+                    return (captured.output, captured.error)
+                end
+                """)
+                try:
+                    wrapped_code = f"begin\n{code_to_exec}\nend"
+                    # use json dumps
+                    julia_code = json.dumps(wrapped_code)
+                    # Prepare the expression 
+                    eval_str = f"capture_eval({julia_code})"
+                    # Run it.
+                    output, error_output = jl.seval(eval_str)
+
+                except Exception:
+                    error_output = traceback.format_exc()
+                    output = ""    
+                 
             elif language == "python":
                 sys.stdout = captured_stdout
                 sys.stderr = captured_stderr
+                original_input = builtins.input
+                def do_input(prompt=''):
+                    self._input_result = ""
+                    self.waiting_for_input = True
+                    # Send the input_request message
+                    self.send_input_request(prompt, False, header, zmq_identities)
+                    # Create a poller for the stdin socket
+                    poller = zmq.Poller()
+                    poller.register(self.stdin_socket, zmq.POLLIN)
+                    while self.waiting_for_input:
+                    # Check for incoming messages on stdin socket
+                        socks = dict(poller.poll(100))  # 100ms timeout
+                        if self.stdin_socket in socks:
+                            self.handle_message("stdin", self.stdin_socket)
+                    return self._input_result
+                builtins.input = do_input
                 try:
                     exec(code_to_exec,globals(),locals())
                 except Exception:
                     error_output = traceback.format_exc()
                     output = ""
                 finally:
-                    # Restore for python aswell
+                    builtins.input = original_input
+                    output = captured_stdout.getvalue()
+                    error_output += captured_stderr.getvalue()
                     sys.stdout = old_stdout
                     sys.stderr = old_stderr
-            output = captured_stdout.getvalue()
-            error_output = captured_stderr.getvalue()
-
-
         except Exception as e:
         # General exception handling 
             error_output = traceback.format_exc()
             output = ""
         finally:
-            # restore always after
+            # Restore stdout and stderr
             sys.stdout = old_stdout
             sys.stderr = old_stderr
         
@@ -340,9 +399,19 @@ class Kernel:
 
         # Send "idle" status 
         self.send_iopub_status("idle", header)       
-
-
-            
+    
+    # function to send input request.
+    def send_input_request(self, prompt, password, parent_header, zmq_identities=None):
+        content = {
+            'prompt': prompt,
+            'password': password
+        }
+        self.send_response('stdin', None, 'input_request', content, parent_header=parent_header, zmq_identities=zmq_identities)
+    
+    # function to handle input reply
+    def handle_input_reply(self, content):
+        self._input_result = content.get('value', '')
+        self.waiting_for_input = False
 
     # Function to handle info request 
     def handle_kernel_info_request(self, socket_name, socket, header, zmq_identities):
@@ -393,6 +462,7 @@ class Kernel:
             poller = zmq.Poller()
             poller.register(self.shell_socket, zmq.POLLIN) # Shell
             poller.register(self.control_socket, zmq.POLLIN) # Control
+            poller.register(self.stdin_socket, zmq.POLLIN) # Stdin for input
 
             # Poll for events with a timeout 
             timeout = 100 # timeout time in ms
@@ -402,9 +472,10 @@ class Kernel:
                 # Handle messages on both sockets using the same handler
                 if self.shell_socket in sockets:
                     self.handle_message("shell", self.shell_socket)
-
                 if self.control_socket in sockets:
                     self.handle_message("control", self.control_socket)
+                if self.stdin_socket in sockets:
+                    self.handle_message("stdin", self.stdin_socket)
 
             except zmq.error.ZMQError as e:
                 if e.errno == zmq.ETERM:
