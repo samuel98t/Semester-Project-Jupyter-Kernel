@@ -52,73 +52,111 @@ class Kernel:
         # Initialize execution count
         self.execution_count = 0
         # Initialize PyJulia
-        # This will be used for stdout/stderr capturing 
-        jl.seval("""
-        module MyStreaming
-            using PythonCall
-            using Base: showerror, catch_backtrace
+        # This will be used for stdout/stderr capturing + input handling
+        jl.seval(r"""
+module MyStreaming
+    using PythonCall
+    using Base: showerror, catch_backtrace
 
-            function streaming_eval(code::String, cb::Any)
-                wrapped_code = "begin\n" * code * "\nend"
-                pysys = pyimport("sys")
-                orig_stdout_write = pysys.stdout.write
-                orig_stderr_write = pysys.stderr.write
+    # defineing stream
+    struct StreamingOutput <: IO
+         callback::Any
+         name::String
+    end
 
-                # Buffers for prints
-                julia_stdout_buffer = IOBuffer()
-                julia_stderr_buffer = IOBuffer()
+    # Should work for both string/ substring
+    function Base.write(io::StreamingOutput, s::Union{String, SubString{String}})
+         io.callback(s, io.name)
+         return length(s)
+    end
 
-                # save to restore later
-                old_stdout = Base.stdout
-                old_stderr = Base.stderr
+    # Single byte takin
+    function Base.write(io::StreamingOutput, b::UInt8)
+         io.callback(string(Char(b)), io.name)
+         return 1
+    end
 
-                try
-                    # override python's
-                    pysys.stdout.write = x -> (cb(x, "stdout"); nothing)
-                    pysys.stderr.write = x -> (cb(x, "stderr"); nothing)
+    function Base.flush(io::StreamingOutput)
+         return nothing
+    end
 
-                    # redirect julia's
-                    Base.stdout = julia_stdout_buffer
-                    Base.stderr = julia_stderr_buffer
+    const input_cb = Ref{Any}(nothing)
+    function set_input_callback(cb::Any)
+         input_cb[] = cb
+    end
 
-                    # eval
-                    result = eval(Meta.parse(wrapped_code))
+    mutable struct JupyterStdin <: IO
+         input_buffer::IOBuffer
+         JupyterStdin() = new(IOBuffer())
+    end
+    const jupyter_stdin = JupyterStdin()
 
+    function Base.readline(io::JupyterStdin)
+         if input_cb[] === nothing
+              throw(ArgumentError("No input callback is set."))
+         end
+         line = input_cb[]("")  # Call the Python callback
+         write(io.input_buffer, string(line) * "\n")
+         seekstart(io.input_buffer)
+         return String(take!(io.input_buffer))
+    end
 
-                    # show result if avaliable
-                    if result !== nothing
-                        cb(repr(result) * "\\n", "stdout")
-                    end
+    function Base.read(io::JupyterStdin, ::Type{UInt8})
+         if eof(io.input_buffer)
+              return UInt8(0)
+         end
+         return read(io.input_buffer, UInt8)
+    end
 
-                catch e
-                    # Show any exceptions
-                    io = IOBuffer()
-                    showerror(io, e, catch_backtrace())
-                    cb(String(take!(io)), "stderr")
+    function streaming_eval(code::String, cb::Any)
+         pysys = pyimport("sys")
+         orig_stdout_write = pysys.stdout.write
+         orig_stderr_write = pysys.stderr.write
+        # keep for restoring
+         old_stdout = Base.stdout
+         old_stderr = Base.stderr
+         old_stdin = Base.stdin
+        # wrap the code for multiline handling
+         code_wrapped = "begin\n" * code * "\nend"
 
-                finally
-                    # Restore julia's stdout/stderr
-                    Base.stdout = old_stdout
-                    Base.stderr = old_stderr
+         # create our streaming stdout/stderr
+         streaming_stdout = StreamingOutput(cb, "stdout")
+         streaming_stderr = StreamingOutput(cb, "stderr")
 
-                    # Restore python's stdout/stderr
-                    pysys.stdout.write = orig_stdout_write
-                    pysys.stderr.write = orig_stderr_write
-                end
+         try
+              pysys.stdout.write = x -> begin
+                   cb(x, "stdout")
+                   nothing
+              end
+              pysys.stderr.write = x -> begin
+                   cb(x, "stderr")
+                   nothing
+              end
+              # override
+              Base.stdout = streaming_stdout
+              Base.stderr = streaming_stderr
+              Base.stdin = jupyter_stdin
 
-                # Forward any text that Julia printed
-                local stdout_str = String(take!(julia_stdout_buffer))
-                local stderr_str = String(take!(julia_stderr_buffer))
+              result = Core.eval(Main, Meta.parse(code_wrapped))
+              if result !== nothing
+                   cb(repr(result) * "\n", "stdout")
+              end
+         catch e
+              io = IOBuffer()
+              showerror(io, e, catch_backtrace())
+              cb(String(take!(io)), "stderr")
+         finally
+              # restore
+              Base.stdout = old_stdout
+              Base.stderr = old_stderr
+              Base.stdin = old_stdin
 
-                if !isempty(stdout_str)
-                    cb(stdout_str, "stdout")
-                end
-                if !isempty(stderr_str)
-                    cb(stderr_str, "stderr")
-                end
-            end
-        end
-        """)
+              pysys.stdout.write = orig_stdout_write
+              pysys.stderr.write = orig_stderr_write
+         end
+    end
+end
+""")
 
 
 
@@ -339,9 +377,33 @@ class Kernel:
         # Try to execute code according to the selected language.
         try :
             if language == "julia":
+
+                # Handles julia input
+                def julia_input_callback(prompt):
+                # This is basically the same approach as do_input in Python.
+                    self._input_result = ""
+                    self.waiting_for_input = True
+
+                    # Send the input_request message
+                    self.send_input_request(prompt, False, header, zmq_identities)
+
+                    # Create a poller for the stdin socket
+                    poller = zmq.Poller()
+                    poller.register(self.stdin_socket, zmq.POLLIN)
+
+                    while self.waiting_for_input:
+                        # Check for incoming messages on stdin socket
+                        socks = dict(poller.poll(100))  # 100ms timeout
+                        if self.stdin_socket in socks:
+                            self.handle_message("stdin", self.stdin_socket)
+                    return self._input_result
+
+                # Handles Julia stdout/stderr
                 def julia_print_callback(chunk,name="stdout"):
                     # Whenever Julia prints something, publish it:
                     self.handle_julia_output(chunk, header,name)
+                # Setup this for input taking
+                jl.MyStreaming.set_input_callback(julia_input_callback)
                 try :
                     # Prepare the expression 
                     print("DEBUG: final code string ->\n", repr(code_to_exec))
