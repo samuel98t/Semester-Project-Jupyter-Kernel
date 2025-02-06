@@ -52,8 +52,74 @@ class Kernel:
         # Initialize execution count
         self.execution_count = 0
         # Initialize PyJulia
-        jl.seval('using InteractiveUtils')
-        jl.seval('using IOCapture')
+        # This will be used for stdout/stderr capturing 
+        jl.seval("""
+        module MyStreaming
+            using PythonCall
+            using Base: showerror, catch_backtrace
+
+            function streaming_eval(code::String, cb::Any)
+                wrapped_code = "begin\n" * code * "\nend"
+                pysys = pyimport("sys")
+                orig_stdout_write = pysys.stdout.write
+                orig_stderr_write = pysys.stderr.write
+
+                # Buffers for prints
+                julia_stdout_buffer = IOBuffer()
+                julia_stderr_buffer = IOBuffer()
+
+                # save to restore later
+                old_stdout = Base.stdout
+                old_stderr = Base.stderr
+
+                try
+                    # override python's
+                    pysys.stdout.write = x -> (cb(x, "stdout"); nothing)
+                    pysys.stderr.write = x -> (cb(x, "stderr"); nothing)
+
+                    # redirect julia's
+                    Base.stdout = julia_stdout_buffer
+                    Base.stderr = julia_stderr_buffer
+
+                    # eval
+                    result = eval(Meta.parse(wrapped_code))
+
+
+                    # show result if avaliable
+                    if result !== nothing
+                        cb(repr(result) * "\\n", "stdout")
+                    end
+
+                catch e
+                    # Show any exceptions
+                    io = IOBuffer()
+                    showerror(io, e, catch_backtrace())
+                    cb(String(take!(io)), "stderr")
+
+                finally
+                    # Restore julia's stdout/stderr
+                    Base.stdout = old_stdout
+                    Base.stderr = old_stderr
+
+                    # Restore python's stdout/stderr
+                    pysys.stdout.write = orig_stdout_write
+                    pysys.stderr.write = orig_stderr_write
+                end
+
+                # Forward any text that Julia printed
+                local stdout_str = String(take!(julia_stdout_buffer))
+                local stderr_str = String(take!(julia_stderr_buffer))
+
+                if !isempty(stdout_str)
+                    cb(stdout_str, "stdout")
+                end
+                if !isempty(stderr_str)
+                    cb(stderr_str, "stderr")
+                end
+            end
+        end
+        """)
+
 
 
     
@@ -273,25 +339,13 @@ class Kernel:
         # Try to execute code according to the selected language.
         try :
             if language == "julia":
-                # Set up Julia output capture
-                jl.seval("""
-                using IOCapture
-    
-                function capture_eval(code)
-                    captured = IOCapture.capture() do
-                        eval(Meta.parse(code))
-                    end
-                    return (captured.output, captured.error)
-                end
-                """)
-                try:
-                    wrapped_code = f"begin\n{code_to_exec}\nend"
-                    # use json dumps
-                    julia_code = json.dumps(wrapped_code)
+                def julia_print_callback(chunk,name="stdout"):
+                    # Whenever Julia prints something, publish it:
+                    self.handle_julia_output(chunk, header,name)
+                try :
                     # Prepare the expression 
-                    eval_str = f"capture_eval({julia_code})"
-                    # Run it.
-                    output, error_output = jl.seval(eval_str)
+                    print("DEBUG: final code string ->\n", repr(code_to_exec))
+                    jl.MyStreaming.streaming_eval(code_to_exec, julia_print_callback)
 
                 except Exception:
                     error_output = traceback.format_exc()
@@ -325,33 +379,30 @@ class Kernel:
                     builtins.input = original_input
                     output = captured_stdout.getvalue()
                     error_output += captured_stderr.getvalue()
-                    sys.stdout = old_stdout
-                    sys.stderr = old_stderr
+
         except Exception as e:
         # General exception handling 
             error_output = traceback.format_exc()
             output = ""
         finally:
-            # Restore stdout and stderr
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-        
-        # Publish output (if theres any)
             if output:
-               output_content = {
-                'output_type': 'stream',
-                'name': 'stdout',
-                'text': output,
-               }
-               self.send_response('iopub', None, 'stream', output_content, parent_header=header)
-        # Publish error output (if theres any)
+                output_content = {
+                    'output_type': 'stream',
+                    'name': 'stdout',
+                    'text': output,
+                }
+                self.send_response('iopub', None, 'stream', output_content, parent_header=header)
             if error_output:
                 error_content = {
-                'output_type': 'stream',
-                'name': 'stderr',
-                'text': error_output,
-            }
+                    'output_type': 'stream',
+                    'name': 'stderr',
+                    'text': error_output,
+                }
                 self.send_response('iopub', None, 'stream', error_content, parent_header=header)
+
+            # restore
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
             
             # Send execute result on shell channel
             execute_reply_content = {
@@ -368,6 +419,22 @@ class Kernel:
             
             self.send_response(socket_name, socket, 'execute_reply', execute_reply_content, parent_header=header, zmq_identities=zmq_identities)
             self.send_iopub_status("idle",header)
+
+    def handle_julia_output(self, text, parent_header,name = "stdout"):
+        if not text:
+            return
+        content = {
+        "output_type": "stream",  
+        "name": name,
+        "text": text,
+        }
+        self.send_response(
+        socket_name='iopub',
+        socket=None,
+        msg_type='stream',
+        content=content,
+        parent_header=parent_header
+        )
 
 
     # This sends busy/idle status
@@ -433,7 +500,7 @@ class Kernel:
                 'mimetype': 'text/x-python',
                 'file_extension': '.ipynb',
                 'pygments_lexer': 'python3',
-                'codemirror_mode': {'name': 'ipython', 'version': 3},
+                'codemirror_mode': {'name': 'jupython', 'version': 3},
             },
             'banner': 'JuliaPythonKernel - A Jupyter kernel for executing Julia and Python code.',
             'help_links': [
