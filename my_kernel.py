@@ -44,13 +44,17 @@ class Kernel:
         self.context = zmq.Context()
         self.waiting_for_input = False
         self._input_result = ""
-
+        # flag for interuption
+        self.interrupted = False
+        self.input_event = threading.Event()
         # Setup the sockets.
         self.shell_socket, self.iopub_socket, self.stdin_socket, self.control_socket, self.hb_socket = self.setup_sockets()
         # Setup the id.
         self.session_id = str(uuid.uuid4())
         # Initialize execution count
         self.execution_count = 0
+        # init python enviorment
+        self.execution_env = {}
         # Initialize PyJulia
         # This will be used for stdout/stderr capturing + input handling
         jl.seval(r"""
@@ -262,6 +266,10 @@ end
             self.handle_kernel_info_request(socket_name, socket, header, zmq_identities)
         elif msg_type == 'input_reply':
             self.handle_input_reply(content)
+        elif msg_type == 'shutdown_request':
+            self.handle_shutdown_request(socket_name,socket,header,parent_header,metadata,content,zmq_identities)
+        elif msg_type == "interrupt_request":
+            self.handle_interrupt_request(socket_name, socket, header, parent_header, metadata, content, zmq_identities)
 
         else:
         # Send all other message types to handle_extra_messages:
@@ -330,8 +338,31 @@ end
             socket_obj.send_multipart(zmq_identities + parts)
         else:
             socket_obj.send_multipart(parts)
-
-
+    # handles shutdown of kernel
+    def handle_shutdown_request(self,socket_name,socket,header,parent_header,metadata,content,zmq_identites):
+        # False by default
+        restart = content.get('restart',False)
+        reply_content = {'restart': restart}
+        self.send_response(socket_name,socket,'shutdown_reply',reply_content,parent_header = header,zmq_identities=zmq_identites)
+        self.shutdown()
+    
+    # shutdown happens here
+    def shutdown(self):
+        print("Shutting down kernel...")
+        # close the sockets
+        self.shell_socket.close()
+        self.iopub_socket.close()
+        self.stdin_socket.close()
+        self.control_socket.close()
+        self.hb_socket.close()
+        self.context.term()
+        sys.exit(0)
+    # handles interrupt requests while in code execution
+    def handle_interrupt_request(self, socket_name, socket, header, parent_header, metadata, content, zmq_identities):
+        print("Interrupt request received") 
+        self.interrupted = True  # set to True
+        reply_content = {}  
+        self.send_response(socket_name, socket, 'interrupt_reply', reply_content, parent_header=header, zmq_identities=zmq_identities)
 
     # Here all the code execution magic should happen, taking the code, identifying language,
     # executing it, sending back responses if theres a need, or output/errors etc...
@@ -339,6 +370,7 @@ end
         self.send_iopub_status("busy",header)
         code = content['code']
         self.execution_count += 1 # increment the exectution count
+        self.interrupted = False 
 
         # send response
         input_content = {
@@ -363,77 +395,67 @@ end
             # DEBUGGING
         print(f"Detected language: {language}")
         print(f"Code to execute: {code_to_exec}")
-        # Execute the code and handle errors
-
-        # Prepare to catch output/errors
+        # Execute the code in a seperate thread
+        execution_thread = threading.Thread(
+            target=self.execute_code,
+            args=(code_to_exec, language, header, zmq_identities)
+        )
+        execution_thread.start()
+    def execute_code(self, code_to_exec, language, header, zmq_identities):
+        # Prepare to capture output
         captured_stdout = io.StringIO()
         captured_stderr = io.StringIO()
-
         old_stdout = sys.stdout
         old_stderr = sys.stderr
         output = ""
         error_output = ""
-
-        # Try to execute code according to the selected language.
-        try :
+    
+        try:
             if language == "julia":
-
-                # Handles julia input
+                # Define the Julia input callback
                 def julia_input_callback(prompt):
-                # This is basically the same approach as do_input in Python.
                     self._input_result = ""
                     self.waiting_for_input = True
-
-                    # Send the input_request message
+                    self.input_event.clear()
                     self.send_input_request(prompt, False, header, zmq_identities)
-
-                    # Create a poller for the stdin socket
-                    poller = zmq.Poller()
-                    poller.register(self.stdin_socket, zmq.POLLIN)
-
-                    while self.waiting_for_input:
-                        # Check for incoming messages on stdin socket
-                        socks = dict(poller.poll(100))  # 100ms timeout
-                        if self.stdin_socket in socks:
-                            self.handle_message("stdin", self.stdin_socket)
+                    self.input_event.wait()
                     return self._input_result
 
-                # Handles Julia stdout/stderr
-                def julia_print_callback(chunk,name="stdout"):
-                    # Whenever Julia prints something, publish it:
-                    self.handle_julia_output(chunk, header,name)
-                # Setup this for input taking
+                # Define the Julia print callback 
+                def julia_print_callback(chunk, name="stdout"):
+                    if self.interrupted:
+                        return
+                    self.handle_julia_output(chunk, header, name)
+            
                 jl.MyStreaming.set_input_callback(julia_input_callback)
-                try :
-                    # Prepare the expression 
+                try:
                     print("DEBUG: final code string ->\n", repr(code_to_exec))
                     jl.MyStreaming.streaming_eval(code_to_exec, julia_print_callback)
-
+                    if self.interrupted:
+                        jl.seval("throw(InterruptException())")
                 except Exception:
                     error_output = traceback.format_exc()
-                    output = ""    
-                 
+                    output = ""
+                
             elif language == "python":
+                # Redirect stdout/stderr for Python code execution
                 sys.stdout = captured_stdout
                 sys.stderr = captured_stderr
                 original_input = builtins.input
+            
                 def do_input(prompt=''):
                     self._input_result = ""
                     self.waiting_for_input = True
-                    # Send the input_request message
+                    self.input_event.clear()
                     self.send_input_request(prompt, False, header, zmq_identities)
-                    # Create a poller for the stdin socket
-                    poller = zmq.Poller()
-                    poller.register(self.stdin_socket, zmq.POLLIN)
-                    while self.waiting_for_input:
-                    # Check for incoming messages on stdin socket
-                        socks = dict(poller.poll(100))  # 100ms timeout
-                        if self.stdin_socket in socks:
-                            self.handle_message("stdin", self.stdin_socket)
+                    self.input_event.wait()
                     return self._input_result
+            
                 builtins.input = do_input
                 try:
-                    exec(code_to_exec,globals(),locals())
+                    exec(code_to_exec, self.execution_env, self.execution_env)
+                    if self.interrupted:
+                        raise KeyboardInterrupt
                 except Exception:
                     error_output = traceback.format_exc()
                     output = ""
@@ -443,10 +465,17 @@ end
                     error_output += captured_stderr.getvalue()
 
         except Exception as e:
-        # General exception handling 
             error_output = traceback.format_exc()
             output = ""
+            if self.interrupted:
+                error_content = {
+                'output_type': 'stream',
+                'name': 'stderr',
+                'text': "Interrupted",
+                }
+                self.send_response('iopub', None, 'stream', error_content, parent_header=header)
         finally:
+            # Send any captured output
             if output:
                 output_content = {
                     'output_type': 'stream',
@@ -461,26 +490,23 @@ end
                     'text': error_output,
                 }
                 self.send_response('iopub', None, 'stream', error_content, parent_header=header)
-
-            # restore
+            # Restore stdout/stderr
             sys.stdout = old_stdout
             sys.stderr = old_stderr
-            
-            # Send execute result on shell channel
+
+            # Send the final execute_reply on the shell channel and update idle status.
             execute_reply_content = {
                 'status': 'ok' if not error_output else 'error',
                 'execution_count': self.execution_count,
-                'payload': [],  # List of display data.
+                'payload': [],
                 'user_expressions': {},
             }
-           
             if error_output:
                 execute_reply_content['ename'] = 'Error'
                 execute_reply_content['evalue'] = str(error_output).splitlines()[-1]
                 execute_reply_content['traceback'] = str(error_output).splitlines()
-            
-            self.send_response(socket_name, socket, 'execute_reply', execute_reply_content, parent_header=header, zmq_identities=zmq_identities)
-            self.send_iopub_status("idle",header)
+            self.send_response('shell', self.shell_socket, 'execute_reply', execute_reply_content, parent_header=header, zmq_identities=zmq_identities)
+            self.send_iopub_status("idle", header)
 
     def handle_julia_output(self, text, parent_header,name = "stdout"):
         if not text:
@@ -541,6 +567,7 @@ end
     def handle_input_reply(self, content):
         self._input_result = content.get('value', '')
         self.waiting_for_input = False
+        self.input_event.set() # unblock
 
     # Function to handle info request 
     def handle_kernel_info_request(self, socket_name, socket, header, zmq_identities):
