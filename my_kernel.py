@@ -14,50 +14,75 @@ import io
 import traceback
 import time
 import builtins
+from multiprocessing import Process, Pipe
 
 
 
+def python_worker(child_conn):
+    # python process to run code in
+    env = {}
+    while True:
+        message = child_conn.recv()
+        if message.get("command") == "exec":
+            execution_id = message.get("execution_id")
+            code = message.get("code", "")
+            # overrides input
+            def custom_input(prompt=''):
+                child_conn.send({
+                    "type": "input_request",
+                    "execution_id": execution_id,
+                    "prompt": prompt
+                })
+                # wait for input response
+                resp = child_conn.recv()
+                if (resp.get("type") == "input_response" and
+                        resp.get("execution_id") == execution_id):
+                    return resp.get("value", "")
+                else:
+                    return ""
+            original_input = builtins.input
+            builtins.input = custom_input
 
+            # redirect stdout/stderr to capture them
+            old_stdout = sys.stdout
+            old_stderr = sys.stderr
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
 
-# read_connection_file is a function that takes a filepath to the connection file,
-#  opens its content and parses it and then returns it.
-def read_connection_file(filepath):
-    try:
-        with open(filepath,'r') as f:
-            connection_info = json.load(f) 
-            return connection_info
-    # deal with file not being found.    
-    except FileNotFoundError:
-        print(f"Error: Connection file not found, wrong path!")
-        sys.exit(1)
-    # deal with JSON file being invalid.
-    except json.JSONDecodeError:
-        print(f"Error: Invalid JSON connection file")
-        sys.exit(1)
+            try:
+                # execute 
+                exec(code, env, env)
+                output = sys.stdout.getvalue()
+                error_output = sys.stderr.getvalue()
+                child_conn.send({
+                    "type": "result",
+                    "execution_id": execution_id,
+                    "status": "ok",
+                    "output": output,
+                    "error": error_output
+                })
+            except Exception:
+                error_output = traceback.format_exc()
+                output = sys.stdout.getvalue()
+                child_conn.send({
+                    "type": "result",
+                    "execution_id": execution_id,
+                    "status": "error",
+                    "output": output,
+                    "error": error_output
+                })
+            finally:
+                # restore
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+                builtins.input = original_input
 
+        elif message.get("command") == "shutdown":
+            break
 
-class Kernel:
-    # init function to take in connection file and create the sockets.
-    def __init__(self,connection_file):
-        self.connection_file = connection_file
-        self.connection_info = read_connection_file(connection_file)
-        self.context = zmq.Context()
-        self.waiting_for_input = False
-        self._input_result = ""
-        # flag for interuption
-        self.interrupted = False
-        self.input_event = threading.Event()
-        # Setup the sockets.
-        self.shell_socket, self.iopub_socket, self.stdin_socket, self.control_socket, self.hb_socket = self.setup_sockets()
-        # Setup the id.
-        self.session_id = str(uuid.uuid4())
-        # Initialize execution count
-        self.execution_count = 0
-        # init python enviorment
-        self.execution_env = {}
-        # Initialize PyJulia
-        # This will be used for stdout/stderr capturing + input handling
-        jl.seval(r"""
+def julia_worker(child_conn):
+    # streaming func for input/stderr/stoudt
+    jl.seval(r"""
 module MyStreaming
     using PythonCall
     using Base: showerror, catch_backtrace
@@ -161,6 +186,102 @@ module MyStreaming
     end
 end
 """)
+    while True:
+        # same as python process
+        message = child_conn.recv()
+        if message.get("command") == "exec":
+            execution_id = message.get("execution_id")
+            code = message.get("code", "")
+            # the callback to send to python using the pipe
+            def julia_input_callback(prompt):
+                child_conn.send({
+                    "type": "input_request",
+                    "execution_id": execution_id,
+                    "prompt": prompt
+                })
+                resp = child_conn.recv()
+                if (resp.get("type") == "input_response" and
+                        resp.get("execution_id") == execution_id):
+                    return resp.get("value", "")
+                else:
+                    return ""
+            jl.MyStreaming.set_input_callback(julia_input_callback)
+            def julia_print_callback(chunk, stream_name):
+                # send chunk 
+                child_conn.send({
+                    "type": "stream",
+                    "execution_id": execution_id,
+                    "stream": stream_name,
+                    "text": chunk
+                })
+            try:
+                jl.MyStreaming.streaming_eval(code, julia_print_callback)
+                child_conn.send({
+                    "type": "result",
+                    "execution_id": execution_id,
+                    "status": "ok",
+                    "output": "",  # Output has been sent via stream messages
+                    "error": ""
+                })
+            except Exception:
+                error_output = traceback.format_exc()
+                child_conn.send({
+                    "type": "result",
+                    "execution_id": execution_id,
+                    "status": "error",
+                    "output": "",
+                    "error": error_output
+                })
+        elif message.get("command") == "shutdown":
+            break
+
+# read_connection_file is a function that takes a filepath to the connection file,
+#  opens its content and parses it and then returns it.
+def read_connection_file(filepath):
+    try:
+        with open(filepath,'r') as f:
+            connection_info = json.load(f) 
+            return connection_info
+    # deal with file not being found.    
+    except FileNotFoundError:
+        print(f"Error: Connection file not found, wrong path!")
+        sys.exit(1)
+    # deal with JSON file being invalid.
+    except json.JSONDecodeError:
+        print(f"Error: Invalid JSON connection file")
+        sys.exit(1)
+
+
+class Kernel:
+    # init function to take in connection file and create the sockets.
+    def __init__(self,connection_file):
+        self.connection_file = connection_file
+        self.connection_info = read_connection_file(connection_file)
+        self.context = zmq.Context()
+        self.waiting_for_input = False
+        self._input_result = ""
+        # flag for interuption
+        self.interrupted = False
+        # track current langaue here
+        self.current_language = None
+        self.input_event = threading.Event()
+        # Setup the sockets.
+        self.shell_socket, self.iopub_socket, self.stdin_socket, self.control_socket, self.hb_socket = self.setup_sockets()
+        # Setup the id.
+        self.session_id = str(uuid.uuid4())
+        # Initialize execution count
+        self.execution_count = 0
+        # init python enviorment
+        self.execution_env = {}
+        # create the processes /pipes
+        self.python_parent_conn, python_child_conn = Pipe()
+        self.julia_parent_conn, julia_child_conn = Pipe()
+        self.python_process = Process(target=python_worker, args=(python_child_conn,))
+        self.julia_process = Process(target=julia_worker, args=(julia_child_conn,))
+        self.python_process.start()
+        self.julia_process.start()
+
+
 
 
 
@@ -283,7 +404,30 @@ end
             zmq_identities
         )
 
+    def handle_extra_messages(self, socket_name, socket, header, parent_header, metadata, content, zmq_identities):
+        msg_type = header["msg_type"]
 
+        # Send "busy" status 
+        self.send_iopub_status("busy", header)
+        if msg_type == "history_request":
+            reply_content = {"history": []}
+            self.send_response(socket_name, socket, "history_reply", reply_content,parent_header=header,zmq_identities=zmq_identities)
+
+        elif msg_type == "comm_info_request":
+            # Must reply with comm_info_reply
+            reply_content = {"comms": {}}
+            self.send_response(socket_name, socket, "comm_info_reply", reply_content,parent_header=header,zmq_identities=zmq_identities)
+
+        elif msg_type in ("comm_open", "comm_msg", "comm_close"):
+            pass
+
+        else:
+        # Catch any other extra messages 
+            print(f"Warning: Unhandled extra msg_type: {msg_type}")
+
+        # Send "idle" status 
+        self.send_iopub_status("idle", header)       
+    
     def sign_message(self, header_str, parent_header_str, metadata_str, content_str):
         # Get the key from our connection_info and make sure its in bytes.
         key = self.connection_info["key"]
@@ -345,10 +489,45 @@ end
         reply_content = {'restart': restart}
         self.send_response(socket_name,socket,'shutdown_reply',reply_content,parent_header = header,zmq_identities=zmq_identites)
         self.shutdown()
-    
+    # handles restarting worker when getting interrupt
+    def restart_worker(self, language):
+        if language == "python":
+            print("Restarting Python worker...")
+            try:
+                self.python_process.terminate()
+                self.python_process.join(timeout=1)
+                if self.python_process.is_alive():
+                    self.python_process.kill()
+                    self.python_process.join()
+            except Exception as e:
+                print("Error terminating Python worker:", e)
+            # create new pipe + worker
+            self.python_parent_conn, python_child_conn = Pipe()
+            self.python_process = Process(target=python_worker, args=(python_child_conn,))
+            self.python_process.start()
+            print("Python worker restarted.")
+        elif language == "julia":
+            print("Restarting Julia worker...")
+            try:
+                self.julia_process.terminate()
+                self.julia_process.join(timeout =1)
+                if self.julia_process.is_alive():
+                    self.julia_process.kill()
+                    self.julia_process.join()
+            except Exception as e:
+                print("Error terminating Julia worker:", e)
+            # create new pipe + worker
+            self.julia_parent_conn, julia_child_conn = Pipe()
+            self.julia_process = Process(target=julia_worker, args=(julia_child_conn,))
+            self.julia_process.start()
+            print("Julia worker restarted.")
+
     # shutdown happens here
     def shutdown(self):
         print("Shutting down kernel...")
+        # close the processes aswell
+        self.python_parent_conn.send({"command": "shutdown"})
+        self.julia_parent_conn.send({"command": "shutdown"})
         # close the sockets
         self.shell_socket.close()
         self.iopub_socket.close()
@@ -361,6 +540,12 @@ end
     def handle_interrupt_request(self, socket_name, socket, header, parent_header, metadata, content, zmq_identities):
         print("Interrupt request received") 
         self.interrupted = True  # set to True
+        if self.current_language == "python":
+            self.restart_worker("python")
+        if self.current_language == "julia":
+            self.restart_worker("julia")
+
+        self.current_language = None # reset it after using it
         reply_content = {}  
         self.send_response(socket_name, socket, 'interrupt_reply', reply_content, parent_header=header, zmq_identities=zmq_identities)
 
@@ -395,118 +580,17 @@ end
             # DEBUGGING
         print(f"Detected language: {language}")
         print(f"Code to execute: {code_to_exec}")
-        # Execute the code in a seperate thread
-        execution_thread = threading.Thread(
-            target=self.execute_code,
-            args=(code_to_exec, language, header, zmq_identities)
-        )
-        execution_thread.start()
-    def execute_code(self, code_to_exec, language, header, zmq_identities):
-        # Prepare to capture output
-        captured_stdout = io.StringIO()
-        captured_stderr = io.StringIO()
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        output = ""
-        error_output = ""
-    
-        try:
-            if language == "julia":
-                # Define the Julia input callback
-                def julia_input_callback(prompt):
-                    self._input_result = ""
-                    self.waiting_for_input = True
-                    self.input_event.clear()
-                    self.send_input_request(prompt, False, header, zmq_identities)
-                    self.input_event.wait()
-                    return self._input_result
-
-                # Define the Julia print callback 
-                def julia_print_callback(chunk, name="stdout"):
-                    if self.interrupted:
-                        return
-                    self.handle_julia_output(chunk, header, name)
-            
-                jl.MyStreaming.set_input_callback(julia_input_callback)
-                try:
-                    print("DEBUG: final code string ->\n", repr(code_to_exec))
-                    jl.MyStreaming.streaming_eval(code_to_exec, julia_print_callback)
-                    if self.interrupted:
-                        jl.seval("throw(InterruptException())")
-                except Exception:
-                    error_output = traceback.format_exc()
-                    output = ""
-                
-            elif language == "python":
-                # Redirect stdout/stderr for Python code execution
-                sys.stdout = captured_stdout
-                sys.stderr = captured_stderr
-                original_input = builtins.input
-            
-                def do_input(prompt=''):
-                    self._input_result = ""
-                    self.waiting_for_input = True
-                    self.input_event.clear()
-                    self.send_input_request(prompt, False, header, zmq_identities)
-                    self.input_event.wait()
-                    return self._input_result
-            
-                builtins.input = do_input
-                try:
-                    exec(code_to_exec, self.execution_env, self.execution_env)
-                    if self.interrupted:
-                        raise KeyboardInterrupt
-                except Exception:
-                    error_output = traceback.format_exc()
-                    output = ""
-                finally:
-                    builtins.input = original_input
-                    output = captured_stdout.getvalue()
-                    error_output += captured_stderr.getvalue()
-
-        except Exception as e:
-            error_output = traceback.format_exc()
-            output = ""
-            if self.interrupted:
-                error_content = {
-                'output_type': 'stream',
-                'name': 'stderr',
-                'text': "Interrupted",
-                }
-                self.send_response('iopub', None, 'stream', error_content, parent_header=header)
-        finally:
-            # Send any captured output
-            if output:
-                output_content = {
-                    'output_type': 'stream',
-                    'name': 'stdout',
-                    'text': output,
-                }
-                self.send_response('iopub', None, 'stream', output_content, parent_header=header)
-            if error_output:
-                error_content = {
-                    'output_type': 'stream',
-                    'name': 'stderr',
-                    'text': error_output,
-                }
-                self.send_response('iopub', None, 'stream', error_content, parent_header=header)
-            # Restore stdout/stderr
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
-
-            # Send the final execute_reply on the shell channel and update idle status.
-            execute_reply_content = {
-                'status': 'ok' if not error_output else 'error',
-                'execution_count': self.execution_count,
-                'payload': [],
-                'user_expressions': {},
-            }
-            if error_output:
-                execute_reply_content['ename'] = 'Error'
-                execute_reply_content['evalue'] = str(error_output).splitlines()[-1]
-                execute_reply_content['traceback'] = str(error_output).splitlines()
-            self.send_response('shell', self.shell_socket, 'execute_reply', execute_reply_content, parent_header=header, zmq_identities=zmq_identities)
-            self.send_iopub_status("idle", header)
+        self.current_language = language
+        execution_id = self.execution_count
+        # send to the correct process
+        if language == "julia":
+            self.julia_parent_conn.send({"command": "exec", "code": code_to_exec, "execution_id": execution_id})
+            pipe = self.julia_parent_conn
+        elif language == "python":
+            self.python_parent_conn.send({"command": "exec", "code": code_to_exec, "execution_id": execution_id})
+            pipe = self.python_parent_conn
+        # Spawn a helper thread to wait for the result and process input requests.
+        threading.Thread(target=self.wait_for_result, args=(pipe, execution_id, header, zmq_identities)).start()
 
     def handle_julia_output(self, text, parent_header,name = "stdout"):
         if not text:
@@ -523,37 +607,86 @@ end
         content=content,
         parent_header=parent_header
         )
-
-
-    # This sends busy/idle status
     def send_iopub_status(self, status_string, parent_header):
         content = {'execution_state': status_string }
         self.send_response('iopub',None,'status',content,parent_header=parent_header)
+        
+    def wait_for_result(self, pipe, execution_id, header, zmq_identities):
+        result = None
+        try:
+            # Loop to handle input/results and stream messages
+            while True:
+                msg = pipe.recv()
+                if msg.get("type") == "input_request" and msg.get("execution_id") == execution_id:
+                    prompt = msg.get("prompt", "")
+                    self.waiting_for_input = True
+                    self.input_event.clear()
+                    self.send_input_request(prompt, False, header, zmq_identities)
+                    self.input_event.wait()  # Block until input_reply is received.
+                    input_value = self._input_result
+                    pipe.send({"type": "input_response", "execution_id": execution_id, "value": input_value})
+                    self.waiting_for_input = False
+                elif msg.get("type") == "stream" and msg.get("execution_id") == execution_id:
+                    # foward the stream msgs to iopub
+                    stream_name = msg.get("stream")
+                    text = msg.get("text")
+                    output_content = {
+                    'output_type': 'stream',
+                    'name': stream_name,
+                    'text': text,
+                    }
+                    self.send_response('iopub', None, 'stream', output_content, parent_header=header, zmq_identities=zmq_identities)
+                elif msg.get("type") == "result" and msg.get("execution_id") == execution_id:
+                    result = msg
+                    break
+        except (EOFError, BrokenPipeError):
+        # for interrupt.
+            print("Worker pipe closed. Exiting wait_for_result thread.")
+            self.send_iopub_status("idle", header)
+            execute_reply_content = {
+            'status': 'abort',
+            'execution_count': self.execution_count,
+            'payload': [],
+            'user_expressions': {},
+            }
+            self.send_response('shell', self.shell_socket, 'execute_reply', execute_reply_content,
+                           parent_header=header, zmq_identities=zmq_identities)
 
-    # this handles unimportant message requests and thier replies.
-    def handle_extra_messages(self, socket_name, socket, header, parent_header, metadata, content, zmq_identities):
-        msg_type = header["msg_type"]
+            return
 
-        # Send "busy" status 
-        self.send_iopub_status("busy", header)
-        if msg_type == "history_request":
-            reply_content = {"history": []}
-            self.send_response(socket_name, socket, "history_reply", reply_content,parent_header=header,zmq_identities=zmq_identities)
+        # If we got a result, process it.
+        if result is None:
+            return
 
-        elif msg_type == "comm_info_request":
-            # Must reply with comm_info_reply
-            reply_content = {"comms": {}}
-            self.send_response(socket_name, socket, "comm_info_reply", reply_content,parent_header=header,zmq_identities=zmq_identities)
-
-        elif msg_type in ("comm_open", "comm_msg", "comm_close"):
-            pass
-
-        else:
-        # Catch any other extra messages 
-            print(f"Warning: Unhandled extra msg_type: {msg_type}")
-
-        # Send "idle" status 
-        self.send_iopub_status("idle", header)       
+        output = result.get("output", "")
+        error = result.get("error", "")
+        if output:
+            output_content = {
+            'output_type': 'stream',
+            'name': 'stdout',
+            'text': output,
+            }
+            self.send_response('iopub', None, 'stream', output_content, parent_header=header, zmq_identities=zmq_identities)
+        if error:
+            error_content = {
+            'output_type': 'stream',
+            'name': 'stderr',
+            'text': error,
+            }
+            self.send_response('iopub', None, 'stream', error_content, parent_header=header, zmq_identities=zmq_identities)
+        status = result.get("status", "ok")
+        execute_reply_content = {
+        'status': status,
+        'execution_count': self.execution_count,
+        'payload': [],
+        'user_expressions': {},
+        }
+        if status != "ok":
+            execute_reply_content['ename'] = 'Error'
+            execute_reply_content['evalue'] = error.splitlines()[-1] if error else ''
+            execute_reply_content['traceback'] = error.splitlines() if error else []
+        self.send_response('shell', self.shell_socket, 'execute_reply', execute_reply_content, parent_header=header, zmq_identities=zmq_identities)
+        self.send_iopub_status("idle", header)      
     
     # function to send input request.
     def send_input_request(self, prompt, password, parent_header, zmq_identities=None):
