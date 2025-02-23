@@ -1,3 +1,2 @@
 zmq
-jupyter_client
 juliacall

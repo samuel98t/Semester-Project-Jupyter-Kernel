@@ -1,5 +1,4 @@
 import zmq
-import jupyter_client
 import sys
 import json
 import uuid
@@ -7,25 +6,64 @@ import threading
 import hmac
 import hashlib
 import datetime
-import juliacall
 from juliacall import Main as jl
 from juliacall import Base as jlbase
 import io
 import traceback
-import time
 import builtins
 from multiprocessing import Process, Pipe
-
+import base64
 
 
 def python_worker(child_conn):
-    # python process to run code in
-    env = {}
+
+    env = {"__builtins__": __builtins__}
     while True:
         message = child_conn.recv()
         if message.get("command") == "exec":
             execution_id = message.get("execution_id")
             code = message.get("code", "")
+
+            # this will override display function for this execution
+            # define display to use the current sys.displayhook
+            def display(value):
+                custom_displayhook(value)
+            env["display"] = display
+
+            def custom_displayhook(value):
+                # store last output
+                builtins._ = value
+                if hasattr(value,'_repr_html_'):
+                    mime_bundle = {"text/html":value._repr_html_()}
+                # png case
+                elif hasattr(value,'_repr_png_'):
+                    png_data = value._repr_png_()
+                    # encode to base64 just incase
+                    b64 = base64.b64encode(png_data).decode('ascii')
+                    mime_bundle = {"image/png":b64}
+                # jpeg case
+                elif hasattr(value, '_repr_jpeg_'):
+                    jpeg_data = value._repr_jpeg_()
+                    b64 = base64.b64encode(jpeg_data).decode('ascii')
+                    mime_bundle = {"image/jpeg": b64}
+                # svg case
+                elif hasattr(value, '_repr_svg_'):
+                    svg_data = value._repr_svg_()
+                    # SVG is text, so no need to encode.
+                    mime_bundle = {"image/svg+xml": svg_data}
+                # default case
+                else:
+                    mime_bundle = {"text/plain": repr(value)}
+                                # send the output using the pipe
+                child_conn.send({
+                    "type": "display_data",
+                    "execution_id": execution_id,
+                    "data":mime_bundle,
+                    "metadata":{}
+                })
+            # overwrite display hook
+            original_displayhook = sys.displayhook
+            sys.displayhook = custom_displayhook
             # overrides input
             def custom_input(prompt=''):
                 child_conn.send({
@@ -76,6 +114,7 @@ def python_worker(child_conn):
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
                 builtins.input = original_input
+                sys.displayhook = original_displayhook
 
         elif message.get("command") == "shutdown":
             break
@@ -86,7 +125,62 @@ def julia_worker(child_conn):
 module MyStreaming
     using PythonCall
     using Base: showerror, catch_backtrace
+    using Base: invokelatest
+    using Base64
+    # function to capture rich data
+    function capture_mime(result)::Dict{String,String}
+        d = Dict{String,String}()
 
+        # Try text/html
+        let io = IOBuffer()
+            if showable(MIME("text/html"), result)
+                show(io, MIME("text/html"), result)
+                str = String(take!(io))
+                if !isempty(str)
+                    d["text/html"] = str
+                end
+            end
+        end
+
+        # Try image/svg+xml
+        let io = IOBuffer()
+            if showable(MIME("image/svg+xml"), result)
+                show(io, MIME("image/svg+xml"), result)
+                str = String(take!(io))
+                if !isempty(str)
+                    d["image/svg+xml"] = str
+                end
+            end
+        end
+
+        # Try image/png (binary, so base64-encode)
+        let io = IOBuffer()
+            if showable(MIME("image/png"), result)
+                show(io, MIME("image/png"), result)
+                data = take!(io)
+                if !isempty(data)
+                    b64 = base64encode(data)
+                    d["image/png"] = b64
+                end
+            end
+        end
+
+        # If we found nothing , use basic default 
+        if isempty(d)
+            let io = IOBuffer()
+                show(io, MIME("text/plain"), result)
+                str = String(take!(io))
+                if isempty(str)
+                    # fallback to repr if plain is empty
+                    d["text/plain"] = repr(result)
+                else
+                    d["text/plain"] = replace(str, "\n" => "")
+                end
+            end
+        end
+
+        return d
+    end
     # defineing stream
     struct StreamingOutput <: IO
          callback::Any
@@ -165,10 +259,13 @@ module MyStreaming
               Base.stdout = streaming_stdout
               Base.stderr = streaming_stderr
               Base.stdin = jupyter_stdin
-
+              
               result = Core.eval(Main, Meta.parse(code_wrapped))
+              # check for rich display
               if result !== nothing
-                   cb(repr(result) * "\n", "stdout")
+                 # attempt capturing
+                 mimebundle = invokelatest(capture_mime,result)
+                 cb(mimebundle, "display_data")
               end
          catch e
               io = IOBuffer()
@@ -207,13 +304,24 @@ end
                     return ""
             jl.MyStreaming.set_input_callback(julia_input_callback)
             def julia_print_callback(chunk, stream_name):
-                # send chunk 
-                child_conn.send({
+                # If we see "display_data"
+                if stream_name == "display_data" and isinstance(chunk, dict):
+                    child_conn.send({
+                        "type": "display_data",
+                        "execution_id": execution_id,
+                        "data": chunk,
+                        "metadata": {}
+                    })
+                else:
+                    if not isinstance(chunk,str):
+                        chunk = str(chunk)
+                    # send chunk 
+                    child_conn.send({
                     "type": "stream",
                     "execution_id": execution_id,
                     "stream": stream_name,
                     "text": chunk
-                })
+                    })
             try:
                 jl.MyStreaming.streaming_eval(code, julia_print_callback)
                 child_conn.send({
@@ -462,6 +570,7 @@ class Kernel:
         if metadata is None :
             metadata = {}
 
+
         # Turn the message parts to JSON
         header_str = json.dumps(header)
         parent_header_str = json.dumps(parent_header)
@@ -482,6 +591,16 @@ class Kernel:
             socket_obj.send_multipart(zmq_identities + parts)
         else:
             socket_obj.send_multipart(parts)
+
+    # function to send display data
+    def send_display_data(self, execution_id, data, metadata, parent_header, zmq_identities=None):
+        content = {
+            "data": data,       
+            "metadata": metadata
+        }
+        self.send_response('iopub', None, 'display_data', content, parent_header=parent_header, zmq_identities=zmq_identities)
+
+
     # handles shutdown of kernel
     def handle_shutdown_request(self,socket_name,socket,header,parent_header,metadata,content,zmq_identites):
         # False by default
@@ -639,6 +758,11 @@ class Kernel:
                 elif msg.get("type") == "result" and msg.get("execution_id") == execution_id:
                     result = msg
                     break
+                elif msg.get("type") == "display_data" and msg.get("execution_id") == execution_id:
+                    mime_bundle = msg.get("data")
+                    metadata = msg.get("metadata", {})
+                    self.send_display_data(execution_id, mime_bundle, metadata, parent_header=header, zmq_identities=zmq_identities)
+
         except (EOFError, BrokenPipeError):
         # for interrupt.
             print("Worker pipe closed. Exiting wait_for_result thread.")
