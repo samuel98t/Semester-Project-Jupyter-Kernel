@@ -32,29 +32,30 @@ def python_worker(child_conn):
 
             def custom_displayhook(value):
                 # store last output
+                mime_bundle = {}
                 builtins._ = value
                 if hasattr(value,'_repr_html_'):
-                    mime_bundle = {"text/html":value._repr_html_()}
+                    mime_bundle["text/html"] = value._repr_html_()
                 # png case
                 elif hasattr(value,'_repr_png_'):
                     png_data = value._repr_png_()
                     # encode to base64 just incase
                     b64 = base64.b64encode(png_data).decode('ascii')
-                    mime_bundle = {"image/png":b64}
+                    mime_bundle["image/png"] = b64
                 # jpeg case
                 elif hasattr(value, '_repr_jpeg_'):
                     jpeg_data = value._repr_jpeg_()
                     b64 = base64.b64encode(jpeg_data).decode('ascii')
-                    mime_bundle = {"image/jpeg": b64}
+                    mime_bundle["image/jpeg"] = b64
                 # svg case
                 elif hasattr(value, '_repr_svg_'):
                     svg_data = value._repr_svg_()
                     # SVG is text, so no need to encode.
-                    mime_bundle = {"image/svg+xml": svg_data}
+                    mime_bundle["image/svg+xml"] = svg_data
                 # default case
                 else:
-                    mime_bundle = {"text/plain": repr(value)}
-                                # send the output using the pipe
+                    mime_bundle["text/plain"] = repr(value)
+                # send the output using the pipe
                 child_conn.send({
                     "type": "display_data",
                     "execution_id": execution_id,
@@ -124,12 +125,12 @@ def julia_worker(child_conn):
     jl.seval(r"""
 module MyStreaming
     using PythonCall
-    using Base: showerror, catch_backtrace
-    using Base: invokelatest
+    using Base: showerror, catch_backtrace, invokelatest, pushdisplay, popdisplay
     using Base64
+    import Base: display
     # function to capture rich data
-    function capture_mime(result)::Dict{String,String}
-        d = Dict{String,String}()
+    function capture_mime(result)::Dict{String,Any}
+        d = Dict{String,Any}()
 
         # Try text/html
         let io = IOBuffer()
@@ -159,27 +160,65 @@ module MyStreaming
                 show(io, MIME("image/png"), result)
                 data = take!(io)
                 if !isempty(data)
-                    b64 = base64encode(data)
-                    d["image/png"] = b64
+                    d["image/png"] = base64encode(data)
                 end
             end
         end
-
+        # Try JPEG
+        let io = IOBuffer()
+            if showable(MIME("image/jpeg"), result)
+                show(io, MIME("image/jpeg"), result)
+                data = take!(io)
+                if !isempty(data)
+                    d["image/jpeg"] = base64encode(data)
+                end
+            end
+        end
         # If we found nothing , use basic default 
         if isempty(d)
             let io = IOBuffer()
                 show(io, MIME("text/plain"), result)
                 str = String(take!(io))
-                if isempty(str)
-                    # fallback to repr if plain is empty
-                    d["text/plain"] = repr(result)
+                if !isempty(str)
+                    d["text/plain"] = str
                 else
-                    d["text/plain"] = replace(str, "\n" => "")
+                    d["text/plain"] = repr(result)
                 end
             end
         end
-
         return d
+    end
+    # Define custom display
+    struct JupyterDisplay <: Base.AbstractDisplay
+        callback::Any
+    end
+    # method of one argument display
+    function Base.display(d::JupyterDisplay, x)
+        mime_bundle = capture_mime(x)
+        if !isempty(mime_bundle)
+            d.callback(mime_bundle, "display_data")
+        end
+        return nothing
+    end
+    # method for 2 argument display
+    function Base.display(d::JupyterDisplay, mime::AbstractString, content)
+        mime_bundle = Dict(mime => content)
+        d.callback(mime_bundle, "display_data")
+        return nothing
+    end
+    # global ref to current active display
+    const active_jupyter_display = Ref{Union{JupyterDisplay, Nothing}}(nothing)
+
+    function display(mime::AbstractString, content)
+        if active_jupyter_display[] !== nothing
+            #use the active display
+            display(active_jupyter_display[], mime, content)
+        else
+            # fallback.
+            println(content)
+            return nothing
+        end
+        return nothing
     end
     # defineing stream
     struct StreamingOutput <: IO
@@ -259,13 +298,19 @@ module MyStreaming
               Base.stdout = streaming_stdout
               Base.stderr = streaming_stderr
               Base.stdin = jupyter_stdin
-              
+            # use custom display to capture cells
+            jdisp = JupyterDisplay(cb)
+            active_jupyter_display[] = jdisp  # set the active display
+            pushdisplay(jdisp)
               result = Core.eval(Main, Meta.parse(code_wrapped))
               # check for rich display
               if result !== nothing
                  # attempt capturing
                  mimebundle = invokelatest(capture_mime,result)
-                 cb(mimebundle, "display_data")
+                 if mimebundle isa Dict{String, Any} && !isempty(mimebundle) 
+                    # callback
+                    cb(mimebundle, "display_data")
+                 end
               end
          catch e
               io = IOBuffer()
@@ -276,6 +321,9 @@ module MyStreaming
               Base.stdout = old_stdout
               Base.stderr = old_stderr
               Base.stdin = old_stdin
+              # restore display aswell
+              popdisplay()
+              active_jupyter_display[] = nothing
 
               pysys.stdout.write = orig_stdout_write
               pysys.stderr.write = orig_stderr_write
@@ -305,14 +353,37 @@ end
             jl.MyStreaming.set_input_callback(julia_input_callback)
             def julia_print_callback(chunk, stream_name):
                 # If we see "display_data"
-                if stream_name == "display_data" and isinstance(chunk, dict):
-                    child_conn.send({
-                        "type": "display_data",
-                        "execution_id": execution_id,
-                        "data": chunk,
-                        "metadata": {}
-                    })
+                if stream_name == "display_data" :
+                    # Check if chunk is a julia dict and if so convert to python
+                    if jl.isa(chunk, jl.Dict):
+                        data = {}
+                        # iter over it
+                        for key in jl.keys(chunk):
+                            py_key = str(key)
+                            value = chunk[key]
+                            # Convert 
+                            if jl.isa(value, jl.String):
+                                data[py_key] = str(value)
+                            else:
+                            # Handle other types 
+                                data[py_key] = value
+                        #  Send as display_data
+                        child_conn.send({
+                            "type": "display_data",
+                            "execution_id": execution_id,
+                            "data": data,
+                            "metadata": {}
+                            })
+                    else:
+                        # Handle non-dict display data (unlikely case)
+                        child_conn.send({
+                            "type": "stream",
+                            "execution_id": execution_id,
+                            "stream": "stdout",
+                            "text": str(chunk)
+                            })
                 else:
+
                     if not isinstance(chunk,str):
                         chunk = str(chunk)
                     # send chunk 
@@ -594,10 +665,16 @@ class Kernel:
 
     # function to send display data
     def send_display_data(self, execution_id, data, metadata, parent_header, zmq_identities=None):
+        formatted_data = {}
+    
+        for mime_type, content in data.items():
+            formatted_data[mime_type] = content
         content = {
-            "data": data,       
-            "metadata": metadata
-        }
+            "data": formatted_data,       
+            "metadata": metadata or {},
+            "transient": {},
+            }
+        print(formatted_data) # DEBUG
         self.send_response('iopub', None, 'display_data', content, parent_header=parent_header, zmq_identities=zmq_identities)
 
 
