@@ -16,7 +16,8 @@ import base64
 
 
 def python_worker(child_conn):
-
+    import re
+    import rlcompleter
     env = {"__builtins__": __builtins__}
     while True:
         message = child_conn.recv()
@@ -119,6 +120,46 @@ def python_worker(child_conn):
 
         elif message.get("command") == "shutdown":
             break
+        elif message.get("command") == "complete":
+            code = message.get("code","")
+            cursor_pos = message.get("cursor_pos",len(code))
+            # create a completer for the current enviorment
+            py_completer = rlcompleter.Completer(namespace=env)
+            # find the token being completed
+            token_match = re.search(r"[\w\.]+$", code[:cursor_pos])
+            token = token_match.group(0) if token_match else ""
+            # use rlcompleter to get matches for our token
+            matches = []
+            if token:
+                i = 0
+                while True:
+                    match = py_completer.complete(token,i)
+                    if match is None:
+                        break
+                    matches.append(match)
+                    i += 1
+            # DEBUG
+            print("Token detected:", token)
+            print("Matches found:", matches)
+            print("Worker env keys:", env.keys())
+            # determine start & end of token
+            if token_match:
+                # position relative 
+                cursor_start = code[:cursor_pos].rindex(token)
+                cursor_end = cursor_start + len(token)
+            else:
+                cursor_start = cursor_pos
+                cursor_end = cursor_pos
+            # Send the completion results back to the kernel
+            child_conn.send({
+                "type": "complete_result",
+                "matches": matches,
+                "cursor_start": cursor_start,
+                "cursor_end": cursor_end,
+                "metadata": {},
+                "status": "ok",
+            })
+
 
 def julia_worker(child_conn):
     # streaming func for input/stderr/stoudt
@@ -202,6 +243,10 @@ module MyStreaming
     end
     # method for 2 argument display
     function Base.display(d::JupyterDisplay, mime::AbstractString, content)
+        if mime in ["image/png", "image/jpeg"] && isa(content, AbstractVector{UInt8})
+            #encode if raw btyes
+            content = base64encode(content)
+        end
         mime_bundle = Dict(mime => content)
         d.callback(mime_bundle, "display_data")
         return nothing
@@ -570,7 +615,8 @@ class Kernel:
             self.handle_shutdown_request(socket_name,socket,header,parent_header,metadata,content,zmq_identities)
         elif msg_type == "interrupt_request":
             self.handle_interrupt_request(socket_name, socket, header, parent_header, metadata, content, zmq_identities)
-
+        elif msg_type == "complete_request":
+            self.handle_complete_request(socket_name, socket, header, parent_header, metadata, content, zmq_identities)
         else:
         # Send all other message types to handle_extra_messages:
             self.handle_extra_messages(
@@ -586,8 +632,6 @@ class Kernel:
     def handle_extra_messages(self, socket_name, socket, header, parent_header, metadata, content, zmq_identities):
         msg_type = header["msg_type"]
 
-        # Send "busy" status 
-        self.send_iopub_status("busy", header)
         if msg_type == "history_request":
             reply_content = {"history": []}
             self.send_response(socket_name, socket, "history_reply", reply_content,parent_header=header,zmq_identities=zmq_identities)
@@ -603,9 +647,7 @@ class Kernel:
         else:
         # Catch any other extra messages 
             print(f"Warning: Unhandled extra msg_type: {msg_type}")
-
-        # Send "idle" status 
-        self.send_iopub_status("idle", header)       
+     
     
     def sign_message(self, header_str, parent_header_str, metadata_str, content_str):
         # Get the key from our connection_info and make sure its in bytes.
@@ -788,6 +830,62 @@ class Kernel:
         # Spawn a helper thread to wait for the result and process input requests.
         threading.Thread(target=self.wait_for_result, args=(pipe, execution_id, header, zmq_identities)).start()
 
+    # function to handle complete request (autocomplete with TAB key)
+    def handle_complete_request(self,socket_name,socket,header,parent_header,metadata,content,zmq_identities):
+        # extrcats the code and cursor position from content
+        code = content.get("code","")
+        #DEBUG
+        print(code)
+        cursor_pos = content.get("cursor_pos",len(code))
+        # first figure out the cell langauge
+        def detect_cell_language(code):
+            if not code.strip():
+                return "python"  # default
+            first_line = code.splitlines()[0].strip()
+            if first_line.startswith("%julia"):
+                return "julia"
+            elif first_line.startswith("%python"):
+                return "python"
+            else:
+                return "python"  # default if no magic is present
+        # python case
+        if detect_cell_language(code) == "python":
+            # send complete command to python worker
+            self.python_parent_conn.send({
+                "command": "complete",
+                "code": code,
+                "cursor_pos": cursor_pos
+            })
+            # wait for reply
+            while True:
+                msg = self.python_parent_conn.recv()
+                if msg.get("type") == "complete_result":
+                    # get matches+ positions
+                    matches = msg["matches"]
+                    cursor_start = msg["cursor_start"]
+                    cursor_end = msg["cursor_end"]
+
+                    # send the reply content as a msg to frontend
+                    reply_content = {
+                        "matches": matches,
+                        "cursor_start": cursor_start,
+                        "cursor_end": cursor_end,
+                        "metadata": {},
+                        "status": msg["status"]  # "ok"
+                    }
+                    # DEBUG
+                    print("Sending complete_reply with content:", reply_content)
+                    # finally send the response and break
+                    print("Socket name is :",socket_name)
+                    self.send_response(socket_name, socket, "complete_reply",reply_content, parent_header=header, zmq_identities=zmq_identities)
+                break
+        else:
+            #TODO JULIA part
+            pass
+
+
+
+
     def handle_julia_output(self, text, parent_header,name = "stdout"):
         if not text:
             return
@@ -905,8 +1003,6 @@ class Kernel:
 
     # Function to handle info request 
     def handle_kernel_info_request(self, socket_name, socket, header, zmq_identities):
-        # Send busy to iopub
-        self.send_iopub_status("busy", header)
         self.send_response('iopub',None,'status',{'execution_state': 'busy'},parent_header=header)
         # DEBUGGING
         print("Handling kernel_info_request...")
@@ -918,12 +1014,12 @@ class Kernel:
             'implementation': 'JuliaPythonKernel', 
             'implementation_version': '0.1.0', 
             'language_info': {
-                'name': 'julia and python',
-                'version': str(jl.eval('VERSION')) if hasattr(jl, 'eval') else sys.version.split()[0] ,
+                'name': 'python',
+                'version': '3.13' ,
                 'mimetype': 'text/x-python',
-                'file_extension': '.ipynb',
+                'file_extension': '.py',
                 'pygments_lexer': 'python3',
-                'codemirror_mode': {'name': 'jupython', 'version': 3},
+                'codemirror_mode': 'ipython',
             },
             'banner': 'JuliaPythonKernel - A Jupyter kernel for executing Julia and Python code.',
             'help_links': [
@@ -933,8 +1029,9 @@ class Kernel:
         # DEBUGGING
         print("Sending kernel_info_reply...",zmq_identities)
         self.send_response(socket_name, socket, 'kernel_info_reply', reply_content, parent_header=header, zmq_identities=zmq_identities)
-        # Send Idle response 
         self.send_iopub_status("idle", header)
+
+
 
 
 
