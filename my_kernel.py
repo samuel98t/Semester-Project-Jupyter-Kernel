@@ -166,9 +166,26 @@ def julia_worker(child_conn):
     jl.seval(r"""
 module MyStreaming
     using PythonCall
+    using REPL
+    using REPL.REPLCompletions
     using Base: showerror, catch_backtrace, invokelatest, pushdisplay, popdisplay
     using Base64
     import Base: display
+    # function to get completions
+    function my_repl_completer(code::String, cursor_pos::Int)
+         comps = REPL.REPLCompletions.completions(code, cursor_pos)
+         matches = comps[1]
+         (cursor_start, cursor_end) = comps[2]
+         # Convert each completion to string whilte stripping extra text 
+        matches_str = [
+            isa(m, REPL.REPLCompletions.KeywordCompletion) ? m.keyword :
+            isa(m, REPL.REPLCompletions.ModuleCompletion)  ? string(m.mod) :
+            string(m)
+            for m in matches
+        ]
+         return matches_str, cursor_start, cursor_end
+    end
+
     # function to capture rich data
     function capture_mime(result)::Dict{String,Any}
         d = Dict{String,Any}()
@@ -444,7 +461,7 @@ end
                     "type": "result",
                     "execution_id": execution_id,
                     "status": "ok",
-                    "output": "",  # Output has been sent via stream messages
+                    "output": "",  
                     "error": ""
                 })
             except Exception:
@@ -458,6 +475,36 @@ end
                 })
         elif message.get("command") == "shutdown":
             break
+        elif message.get("command") == "complete":
+            code = message.get("code", "")
+            cursor_pos = message.get("cursor_pos", len(code))
+            try:
+                # call the julia completer function
+                result = jl.MyStreaming.my_repl_completer(code, cursor_pos)
+                completions = list(result[0])  # convert to python list
+                cursor_start = int(result[1])-1  # makes sure these are ints
+                cursor_end = cursor_pos
+
+                child_conn.send({
+                    "type": "complete_result",
+                    "matches": completions,
+                    "cursor_start": cursor_start,
+                    "cursor_end": cursor_end,
+                    "metadata": {},
+                    "status": "ok"
+                })
+            # error , i didnt do one for python tho
+            except Exception:
+                error_output = traceback.format_exc()
+                child_conn.send({
+                    "type": "complete_result",
+                    "matches": [],
+                    "cursor_start": cursor_pos,
+                    "cursor_end": cursor_pos,
+                    "metadata": {},
+                    "status": "error",
+                    "error": error_output
+            })
 
 # read_connection_file is a function that takes a filepath to the connection file,
 #  opens its content and parses it and then returns it.
@@ -832,6 +879,7 @@ class Kernel:
 
     # function to handle complete request (autocomplete with TAB key)
     def handle_complete_request(self,socket_name,socket,header,parent_header,metadata,content,zmq_identities):
+        self.send_iopub_status("busy", header) # send busy
         # extrcats the code and cursor position from content
         code = content.get("code","")
         #DEBUG
@@ -880,9 +928,29 @@ class Kernel:
                     self.send_response(socket_name, socket, "complete_reply",reply_content, parent_header=header, zmq_identities=zmq_identities)
                 break
         else:
-            #TODO JULIA part
-            pass
+            # send to julia process
+            self.julia_parent_conn.send({
+                "command": "complete",
+                "code": code,
+                "cursor_pos": cursor_pos
+                })
+            # wait for reply
+            while True:
+                msg = self.julia_parent_conn.recv()
+                if msg.get("type") == "complete_result":
+                    reply_content = {
+                        "matches": msg["matches"],
+                        "cursor_start": msg["cursor_start"],
+                        "cursor_end": msg["cursor_end"],
+                        "metadata": {},
+                        "status": msg["status"],
+                    }
+                    #DEBUG
+                    print(reply_content)
+                    self.send_response(socket_name, socket, "complete_reply", reply_content, parent_header=header, zmq_identities=zmq_identities)
+                    break
 
+        self.send_iopub_status("idle", header) # send idle
 
 
 
