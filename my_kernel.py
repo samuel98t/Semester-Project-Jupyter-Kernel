@@ -14,6 +14,38 @@ import builtins
 from multiprocessing import Process, Pipe
 import base64
 
+# small helper func to help with types for bridging
+def get_julia_value(varname):
+    val_jl = jl.seval(varname)
+    # if its julia dict
+    if jl.isa(val_jl, jl.Dict):
+        py_dict = {}
+        for (k, v) in val_jl.items():
+            key_str = str(k)  # ensure it's a string
+            if jl.isa(v, jl.Array):
+                eltype = jl.Base.eltype(v)
+                if str(eltype) == "Char":
+                    py_dict[key_str] = "".join(str(x) for x in v)
+                else:
+                    py_dict[key_str] = list(v)
+            elif jl.isa(v, jl.Dict):
+                py_dict[key_str] = dict(v)  #
+            else:
+                py_dict[key_str] = v
+        return py_dict
+
+    # if its an array
+    if jl.isa(val_jl, jl.Array):
+        eltype = jl.Base.eltype(val_jl)
+        if str(eltype) == "Char":
+            # convertt
+            return "".join(str(ch) for ch in val_jl)
+        else:
+            # array to list
+            return list(val_jl)
+
+    # treat as scalar or string
+    return val_jl
 
 def python_worker(child_conn):
     import re
@@ -159,9 +191,45 @@ def python_worker(child_conn):
                 "metadata": {},
                 "status": "ok",
             })
-
+        elif message.get("command") == "get_vars":
+            requested_vars = message.get("variables", [])
+            results = {}
+            for varname in requested_vars:
+                if varname in env:
+                    value = env[varname]
+                    try:
+                        serialized = json.dumps(value)
+                    except:
+                        # if not json serialziable
+                        serialized = None
+                    results[varname] = serialized
+            
+            child_conn.send({
+                "type": "vars_data",
+                "variables": results
+            })
+        elif message.get("command") == "set_vars":
+            
+            data = message.get("data", {})
+            for varname, val_json in data.items():
+                if val_json is not None:
+                    try:
+                        val = json.loads(val_json)
+                    except:
+                        val = None
+                    env[varname] = val
+            print("DEBUG worker environment keys now:", list(env.keys()))
+            child_conn.send({
+                "type": "set_vars_ok"
+            })
 
 def julia_worker(child_conn):
+    # for variable bridging 
+    jl.seval("""
+    if !isdefined(Main, :temp_val)
+        global temp_val = nothing
+    end
+    """)
     # streaming func for input/stderr/stoudt
     jl.seval(r"""
 module MyStreaming
@@ -505,6 +573,29 @@ end
                     "status": "error",
                     "error": error_output
             })
+        elif message.get("command") == "get_vars":
+            requested_vars = message.get("variables", [])
+            results = {}
+            for varname in requested_vars:
+                try:
+                    val_py = get_julia_value(varname)  # Use the function above
+                    print(f"Bridging {varname}: type={type(val_py)}, value={val_py}")
+                    # Then do JSON:
+                    serialized = json.dumps(val_py)
+                except Exception as e:
+                    print(f"Error serializing {varname}:{e}")
+                    serialized = None
+                results[varname] = serialized
+            child_conn.send({"type": "vars_data", "variables": results})
+        elif message.get("command") == "set_vars":
+            data = message.get("data", {})
+            for varname, val_json in data.items():
+                val_py = json.loads(val_json) if val_json else None
+                jl.Main.temp_val = val_py
+                jl.seval(f"global {varname} = temp_val")
+                # clear temp
+                jl.seval("global temp_val = nothing")
+            child_conn.send({"type": "set_vars_ok"})
 
 # read_connection_file is a function that takes a filepath to the connection file,
 #  opens its content and parses it and then returns it.
@@ -557,6 +648,60 @@ class Kernel:
 
 
     
+    # the briding between 2 lang variables function
+    def bridge_func(self,lang,var_list):
+        # ask python for varibles.
+        if lang == "py2jl":
+            request = {
+            "command": "get_vars",
+            "variables": var_list
+            }
+            self.python_parent_conn.send(request)
+            vars_data = {}
+            # wait for response
+            while True:
+                msg = self.python_parent_conn.recv()
+                if msg.get("type") == "vars_data":
+                    vars_data = msg.get("variables", {})  
+                    break
+            # now pass that to julia worker
+            request_julia = {
+            "command": "set_vars",
+            "data": vars_data  
+            }
+            self.julia_parent_conn.send(request_julia)
+
+            # Wait for "set_vars_ok"
+            while True:
+                msg = self.julia_parent_conn.recv()
+                if msg.get("type") == "set_vars_ok":
+                    # bridging complete
+                    return
+        # same thing here but for jl2py
+        elif lang == "jl2py":
+            # send to julia
+            self.julia_parent_conn.send({
+            "command": "get_vars",
+            "variables": var_list
+            })
+            vars_data = {}
+            while True:
+                # wait for response
+                msg = self.julia_parent_conn.recv()
+                if msg.get("type") == "vars_data":
+                    vars_data = msg.get("variables", {})
+                    break
+        
+            # send to python
+            self.python_parent_conn.send({
+                "command": "set_vars",
+                "data": vars_data
+                })
+            while True:
+                msg = self.python_parent_conn.recv()
+                if msg.get("type") == "set_vars_ok":
+                    #done 
+                    return
 
     def setup_sockets(self):
         # Shell socket which is a router type
@@ -852,30 +997,64 @@ class Kernel:
         # Language detection using magics
         lines = code.split('\n')
         line_1 = lines[0].strip()
-        if line_1.startswith("%julia"):
+        # Default to python if there is no magic command
+        language = "python"
+        code_to_exec = code
+        # added bridging logic to move basic variables between langauges
+        bridge = False 
+        if line_1.startswith("%py2jl"):
+            bridge = True
+            language = "julia"
+            vars_str = line_1[len("%py2jl"):].strip()  
+            var_list = [v.strip() for v in vars_str.split(',') if v.strip()]
+            self.bridge_func("py2jl",var_list)
+        elif line_1.startswith("%jl2py"):
+            bridge = True
+            language = "python"
+            vars_str = line_1[len("%jl2py"):].strip()  
+            var_list = [v.strip() for v in vars_str.split(',') if v.strip()]
+            self.bridge_func("jl2py",var_list)
+        elif line_1.startswith("%julia"):
             language = "julia"
             code_to_exec = '\n'.join(lines[1:])
         elif line_1.startswith("%python"):
             language = "python"
             code_to_exec = '\n'.join(lines[1:])
-        else:
-            # Default to python if there is no magic command
-            language = "python"
-            code_to_exec = code
-            # DEBUGGING
+        # DEBUGGING
         print(f"Detected language: {language}")
         print(f"Code to execute: {code_to_exec}")
         self.current_language = language
         execution_id = self.execution_count
         # send to the correct process
-        if language == "julia":
+        if language == "julia" and not(bridge):
             self.julia_parent_conn.send({"command": "exec", "code": code_to_exec, "execution_id": execution_id})
             pipe = self.julia_parent_conn
-        elif language == "python":
+        elif language == "python" and not(bridge):
             self.python_parent_conn.send({"command": "exec", "code": code_to_exec, "execution_id": execution_id})
             pipe = self.python_parent_conn
         # Spawn a helper thread to wait for the result and process input requests.
-        threading.Thread(target=self.wait_for_result, args=(pipe, execution_id, header, zmq_identities)).start()
+        if not(bridge):
+            threading.Thread(target=self.wait_for_result, args=(pipe, execution_id, header, zmq_identities)).start()
+        # send execute reply after bridging so kernel can continue working
+        if bridge:
+            execute_reply_content = {
+                'status': 'ok',
+                'execution_count': self.execution_count,
+                'payload': [],
+                'user_expressions': {}
+            }
+            # send it on the "shell" socket
+            self.send_response(
+                'shell',
+                self.shell_socket,
+                'execute_reply',
+                execute_reply_content,
+                parent_header=header,
+                zmq_identities=zmq_identities
+            )
+            # also idle
+            self.send_iopub_status("idle", header)
+        bridge = False
 
     # function to handle complete request (autocomplete with TAB key)
     def handle_complete_request(self,socket_name,socket,header,parent_header,metadata,content,zmq_identities):
