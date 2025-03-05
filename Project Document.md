@@ -46,7 +46,10 @@ after identifying the language we send it to the correct execution engine . for 
 -To be able to use julia i have to install Pyjulia , so install jill first then pyjulia then import it.
 after installing and importing , ill have initialize it in my kernel init function aswell as adding the execution count variable which will be used soon.
 after finishing my handle_execute function i need to debug, i already started but getting issues because i forgot to install julia on pc, doing that then will continue debugging.
-![[problem1.png]]
+
+[![problem1.png](https://i.postimg.cc/m2f1S2Bc/problem1.png)](https://postimg.cc/K4fYGbKF)
+
+
 
 tried creating new environment and reinstalling everything.uninstalled jill and used juliacall instead, seemes to fix the issues. changed my code accordingly.
 
@@ -57,9 +60,10 @@ Notes for me : ** Currently to run it im using Running it on VScode then using j
 
 -Kernel is currently failing because its expecting a response to kernel info request and not getting any.
 ill create a function handle_kernel_info_request to handle it.
-![[problem2.png]]
+[![problem2.png](https://i.postimg.cc/VLqrZQkK/problem2.png)](https://postimg.cc/nCLhMW7m)
 Kernel Loaded after hrs of debugging, progress!!!.
-![[problem3.png]]
+
+[![problem3.png](https://i.postimg.cc/wj9tSftg/problem3.png)](https://postimg.cc/YhyqFxfs)
 
 i'll make a requirments.txt file now to make running the code easier. ill add to it more stuff as the project develops.
 Now to work on code exectuion, i need to figure out what messages need to be sent /recieved during the whole proecess .
@@ -80,21 +84,21 @@ so far its not working but ill keep trying different stuff.
 - ill make a handle_extra_messages function to handle non-important message requests and thier replies (usually empty)
 
 To get it to work on jupyter notebook it took alot of more work, since its relatively more complex than just getting it to work on jupyter console, but im happy that after all the debugging and new functions/function changing , the kernel now loads on jupyter notebook !, after connecting and getting the kernel info and other msg requests , it goes into idle mode waiting for actions .
-![[notebookworked.png]]
+[![notebookworked.png](https://i.postimg.cc/BnCFb9Wj/notebookworked.png)](https://postimg.cc/BjXb7zn3)
 
 -Next up checking the simple code execution of the kernel.
-![[pythonexecutesimple.png]]
+[![pythonexecutesimple.png](https://i.postimg.cc/htMJgLxx/pythonexecutesimple.png)](https://postimg.cc/K1kcDg0v)
 
 So python execution seems to work, julia didnt for some reason ( i tried println("hello from julia")) so for now ill try to debug and fix that.
 after debugging for a bit i figured the issue is me not capturing the julia output stream, so ill be working on figuring that out next session.
 
 Im having alot of trouble getting the julia code to run correctly and return the stdout/stderr, after trying different approaches, the code worked for a single println but then gets an error for mulitple lines.
-![[Capture.png]]
+[![Capture.png](https://i.postimg.cc/cL7HhQT2/Capture.png)](https://postimg.cc/CR1SLn3s)
 
 I fixed it after trying mulitple methods, the thing that finally worked for multiline code was wrapping the julia code
 with "begin" and "end" then use json.dumps on it, then finally running it with capture eval.
 
-![[Capture2.png]]
+[![Capture2.png](https://i.postimg.cc/k5n5pBp4/Capture2.png)](https://postimg.cc/ZWMZ9KZt)
 
 So far so good, got basic different codes running in different cells, with different languages!.
 
@@ -104,7 +108,7 @@ Now i need to work on taking in input from julia and python correctly, starting 
 Now ill work on my execute code function to implement taking in input. ill start with python since it should be simpler to do .
 i got some basic input working but for some reason the kernel gets stuck after reciveing the input
 
-![[Capture3.png]]
+[![Capture3.png](https://i.postimg.cc/6QYQJtkh/Capture3.png)](https://postimg.cc/qt6r2VMt)
 the problem was it seems that i needed to pool to get the reply so it doesnt get stuck, changed my code and now its working! will work on julia input (which should be harder to implement) next session.
 
 For julia input capturing i created a julia_input_callback function simillar to the python one, and added functions in julia language to handle the code capturing collabing with python , after trying multiple approaches and having problems/blocks ( notebook got stuck when asking for julia input) and fixing it, julia can take input but now a new problem arised , it seems that taking input is blocking iocapture from working proprerly. 
@@ -114,11 +118,11 @@ I tried a new streaming method, currently its not working.
 
 i managed to get the new reimplementaion to work , hopefully this will be better than the IOcapture approach, so basically overrode python's stdout/stderr for a bit then restored them.
 now for input taking ill make a simillar function to python's with a pooler to handle  julia's input, as for the input capturing im thinking of using a simillar method to my stdout taking. after trying a bunch of different methods i found something that worked, it streams the prints, and handles inputs correctly
-![[Capturedsa.png]]
+[![Capturedsa.png](https://i.postimg.cc/KjgcMLR9/Capturedsa.png)](https://postimg.cc/JHMWws3J)
 
 So far so good, now ill try to do some small changes and then try a more complex input/printing to make sure its working fine, for example a function
-![[p1.png]]
-![[p2.png]]
+[![p1.png](https://i.postimg.cc/NMK2dKKX/p1.png)](https://postimg.cc/N9w0Mf7G)
+[![p2.png](https://i.postimg.cc/pdGnQfLx/p2.png)](https://postimg.cc/R3tF4ntb)
 
 ### Interrupt + others
 
@@ -154,7 +158,7 @@ Added restart worker which bascially restarts the excecution process when we get
 Also made a thread to process input requests and results using the newly defined wait for result function ( waiting for results func) , added interrupt handling where if theres an interrupt we just close the process and restart it. also changed the kernel json file to tell the kernel to use interrupt messages instead of signals.
 
 So now i have a working interrupt + julia and python get thier own process with pipes to communicate with main thread and a helper thread for input etc...
-![[Capture42.png]]
+[![Capture42.png](https://i.postimg.cc/qRFMqQMh/Capture42.png)](https://postimg.cc/bDQjFxnp)
 
 Both of these got interrupted succesfully and the other cells worked after the restart.
 -P.S since the interrupt restarts the process, running new code again will take a bit longer since it'll init some stuff , but only the first code run in that language, the rest will run fast.
@@ -165,17 +169,17 @@ Both of these got interrupted succesfully and the other cells worked after the r
 - Added send display data function for that purpose.
 - inside python worker, i made a function custom_display using builtins to override pythons display , capture the displays according to thier type, ( basically the same approach as i did with inputs earlier.+ added a handling elif in my wait_for result thread to handle the display data and send response.
 i did the python stuff first because its less complicated :
-![[Captukre.png]]
-![[Capturey.png]]
+[![Captukre.png](https://i.postimg.cc/c4n6gq3s/Captukre.png)](https://postimg.cc/qzppS5QY)
+[![Capturey.png](https://i.postimg.cc/CdThH18w/Capturey.png)](https://postimg.cc/n92fnnTW)
 Cat pic
-![[mycat.png]]
+[![mycat.png](https://i.postimg.cc/3Np4HzCJ/mycat.png)](https://postimg.cc/CnhLGPQW)
 
 Now since its working ill try adding more types of formats to display, like jpeg and svg.
 - this method will rely on a _repr function, from what i saw, most popular libs have one so it shouldnt be an issue, i changed my code again to ovewrite displayhook instead of display.
 matplob compatibility looks like a challenge so ill do the julia part for now and maybe get back to it later.
 
 as for julia i tried using the same approach by making a funcing in my MyStreaming to do the same as the python function, currently im getting issues and instead of a plot, its giving back a string stream representation of it, so now im trying to figure out why and fixing it. ( also edited printcallback), 
-![[plots.png]]
+[![plots.png](https://i.postimg.cc/y6SS9S44/plots.png)](https://postimg.cc/yWsdCx8v)
 i reformatted both the python and julia display functions, and aswell the send_display function so hopefully that'll help and not cause more bugs. not working, ill try changing Dict String to Dict Any in julia code.
 
 it works you'll have to just use display() and its not inline the notebook.. i think its like matplot problem, so for now ill just check basic images png/jpeg/svg/html.
@@ -186,14 +190,14 @@ that'll store current display.
 i tried to make sure the dict is converted while passed to python and it still didnt help , ill keep it because its better to check anyway.
 
 Nevermind!! that was actually the issue ! i just needed to relax the constaints of the "if". For now HTML worked, ill try/work on the rest next session.
-![[Works.png]]
+[![Works.png](https://i.postimg.cc/mD1hQKnN/Works.png)](https://postimg.cc/YGkp7DMh)
 
 Okay now ill test other display types!
 SVG worked, png didnt, will be figuring out why and fixing it. ok the problem is sending the raw png bytes will casue an error but b64 encoding them first works. fixed it by adding a check in my display function that automatically converts to b64 if the image already isnt!
 
-![[svgjulia.png]]
-![[jpeg.png]]
-![[jpg.png]]
+[![svgjulia.png](https://i.postimg.cc/Bv6jvjcz/svgjulia.png)](https://postimg.cc/PCgX3r7b)
+[![jpeg.png](https://i.postimg.cc/mDKzJT95/jpeg.png)](https://postimg.cc/qhXvCVjs)
+[![jpg.png](https://i.postimg.cc/13S6yRdx/jpg.png)](https://postimg.cc/1fW4HSPM)
 
 ### Auto Complete
 
@@ -206,18 +210,18 @@ after doing all of this it didnt quite work, i think ill move the complete handl
 
 Okay so i switched it and edited some stuff, made some progress, the tokens are detected correctly in my debugs but im not getting anything to help autocomplete in the notebook itself. so gotta find out why.
 the reply content looks correct aswell.
-![[complete.png]]
-![[the reply conent also looks correct.png]]
+[![complete.png](https://i.postimg.cc/CMZbNQ82/complete.png)](https://postimg.cc/dDY7Qn4R)
+[![the-reply-conent-also-looks-correct.png](https://i.postimg.cc/BvVXPJmn/the-reply-conent-also-looks-correct.png)](https://postimg.cc/wtD6SYKC)
 
 i cant seem to pinpoint the issue, i tried some code changes that didnt help, the reply message looks correct so in theory i should be getting a autocomplete popup. but for some reason im not.
 apparently the problem was not wrapping it in a busy idle ... took way too long to debug for something this simple, i thought busy idle was for time consuming stuff like execution and the documentation didnt mention using it for complete requests..oh well it works now.
-![[completeworks.png]]
+[![completeworks.png](https://i.postimg.cc/sD77FGw9/completeworks.png)](https://postimg.cc/nCVCBr8C)
 
 Lets see, now to do this in julia, after looking at some methods i can do the naive way by iterating over possible
 functions in Base etc, or just use REPLCompletions , i'll use the ReplCompletions since it seems more effiecient, ill make a julia function to handle completions, send it in the correct format to the python side, etc like the python way. 
 
 it worked but its giving too much text not just the autocomplete, lemme try to remove the extra text, its almost working! just small issue with im guessing cursor pos/start/end where stuff isnt getting replaced totally. got it to work!
-![[completejulia.png]]
+[![completejulia.png](https://i.postimg.cc/G3ZGSxJm/completejulia.png)](https://postimg.cc/pyJmm86w)
 
 ### Bridging 
 
@@ -225,7 +229,7 @@ next up the bridging logic, i wanna be able to move atleast basic variables from
 
 it works!
 
-![[bridge1.png]]![[bridge2.png]]![[bridge3.png]]
+[![bridge1.png](https://i.postimg.cc/Y9DjgM8S/bridge1.png)](https://postimg.cc/LYfHFdcd)[![bridge2.png](https://i.postimg.cc/zDMVGDVt/bridge2.png)](https://postimg.cc/c6RsDS7w)[![bridge3.png](https://i.postimg.cc/2yP6cGsR/bridge3.png)](https://postimg.cc/zHF83CD0)
 
 ### Conclusion 
 
