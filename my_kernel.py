@@ -170,10 +170,6 @@ def python_worker(child_conn):
                         break
                     matches.append(match)
                     i += 1
-            # DEBUG
-            print("Token detected:", token)
-            print("Matches found:", matches)
-            print("Worker env keys:", env.keys())
             # determine start & end of token
             if token_match:
                 # position relative 
@@ -218,7 +214,7 @@ def python_worker(child_conn):
                     except:
                         val = None
                     env[varname] = val
-            print("DEBUG worker environment keys now:", list(env.keys()))
+           
             child_conn.send({
                 "type": "set_vars_ok"
             })
@@ -579,11 +575,11 @@ end
             for varname in requested_vars:
                 try:
                     val_py = get_julia_value(varname)  # Use the function above
-                    print(f"Bridging {varname}: type={type(val_py)}, value={val_py}")
+                    
                     # Then do JSON:
                     serialized = json.dumps(val_py)
                 except Exception as e:
-                    print(f"Error serializing {varname}:{e}")
+                    
                     serialized = None
                 results[varname] = serialized
             child_conn.send({"type": "vars_data", "variables": results})
@@ -606,11 +602,11 @@ def read_connection_file(filepath):
             return connection_info
     # deal with file not being found.    
     except FileNotFoundError:
-        print(f"Error: Connection file not found, wrong path!")
+        
         sys.exit(1)
     # deal with JSON file being invalid.
     except json.JSONDecodeError:
-        print(f"Error: Invalid JSON connection file")
+        
         sys.exit(1)
 
 
@@ -770,9 +766,7 @@ class Kernel:
     # cuts it in to the relevant parts to handle it 
     # accordingly to its type
     def handle_message(self,socket_name,socket):
-        message = socket.recv_multipart()
-        # DEBUGGING
-        print(f"Raw message received on {socket_name}: {message}")  
+        message = socket.recv_multipart() 
         zmq_identities = message[:-6]  # The ZMQ identities are all parts *before* the last 6 (delimiter, signature, headers, content)
         delimiter = message[-6]
         signature = message[-5]
@@ -782,7 +776,6 @@ class Kernel:
         content_bytes = message[-1]
         # Validate the signature
         if not self.validate_signature([delimiter, signature, header_bytes, parent_header_bytes, metadata_bytes, content_bytes]):
-            print(f"Signature validation failed on {socket_name}")
             return
 
         header = json.loads(header_bytes)
@@ -791,10 +784,7 @@ class Kernel:
         content = json.loads(content_bytes)
         msg_type = header['msg_type']
 
-        # FOR DEBUGGING
-        print(f"Received message of type: {msg_type} on {socket_name} socket")
 
-        #TODO HANDLE MESSAGE ACCORDING TO ITS TYPE.
         # Deal with execute request messages
         if msg_type == 'execute_request':
             self.handle_execute_request(socket_name, socket, header, parent_header, metadata, content, zmq_identities)
@@ -908,7 +898,6 @@ class Kernel:
             "metadata": metadata or {},
             "transient": {},
             }
-        print(formatted_data) # DEBUG
         self.send_response('iopub', None, 'display_data', content, parent_header=parent_header, zmq_identities=zmq_identities)
 
 
@@ -967,8 +956,7 @@ class Kernel:
         self.context.term()
         sys.exit(0)
     # handles interrupt requests while in code execution
-    def handle_interrupt_request(self, socket_name, socket, header, parent_header, metadata, content, zmq_identities):
-        print("Interrupt request received") 
+    def handle_interrupt_request(self, socket_name, socket, header, parent_header, metadata, content, zmq_identities): 
         self.interrupted = True  # set to True
         if self.current_language == "python":
             self.restart_worker("python")
@@ -1002,27 +990,32 @@ class Kernel:
         code_to_exec = code
         # added bridging logic to move basic variables between langauges
         bridge = False 
-        if line_1.startswith("%py2jl"):
+        if line_1.startswith("%py2jl") or line_1.startswith("%jl2py"):
             bridge = True
-            language = "julia"
-            vars_str = line_1[len("%py2jl"):].strip()  
-            var_list = [v.strip() for v in vars_str.split(',') if v.strip()]
-            self.bridge_func("py2jl",var_list)
-        elif line_1.startswith("%jl2py"):
-            bridge = True
-            language = "python"
-            vars_str = line_1[len("%jl2py"):].strip()  
-            var_list = [v.strip() for v in vars_str.split(',') if v.strip()]
-            self.bridge_func("jl2py",var_list)
+            if line_1.startswith("%py2jl"):
+                language = "julia"
+                direction = "py2jl"
+                magic = "%py2jl"
+            else:
+                language = "python"
+                direction = "jl2py"
+                magic = "%jl2py"
+            # collect variable names from the whole cell
+            first_line_extra = line_1[len(magic):].strip()
+            var_text = first_line_extra
+            if len(lines) > 1:
+                var_text += " " + " ".join(line.strip() for line in lines[1:] if line.strip())
+            # split the variables
+            var_list = [v.strip() for v in var_text.replace(',', ' ').split() if v.strip()]
+            self.bridge_func(direction, var_list)
+            # this cell is just for bridging no need to execute code.
+            code_to_exec = ""
         elif line_1.startswith("%julia"):
             language = "julia"
             code_to_exec = '\n'.join(lines[1:])
         elif line_1.startswith("%python"):
             language = "python"
             code_to_exec = '\n'.join(lines[1:])
-        # DEBUGGING
-        print(f"Detected language: {language}")
-        print(f"Code to execute: {code_to_exec}")
         self.current_language = language
         execution_id = self.execution_count
         # send to the correct process
@@ -1061,8 +1054,6 @@ class Kernel:
         self.send_iopub_status("busy", header) # send busy
         # extrcats the code and cursor position from content
         code = content.get("code","")
-        #DEBUG
-        print(code)
         cursor_pos = content.get("cursor_pos",len(code))
         # first figure out the cell langauge
         def detect_cell_language(code):
@@ -1100,10 +1091,6 @@ class Kernel:
                         "metadata": {},
                         "status": msg["status"]  # "ok"
                     }
-                    # DEBUG
-                    print("Sending complete_reply with content:", reply_content)
-                    # finally send the response and break
-                    print("Socket name is :",socket_name)
                     self.send_response(socket_name, socket, "complete_reply",reply_content, parent_header=header, zmq_identities=zmq_identities)
                 break
         else:
@@ -1124,8 +1111,6 @@ class Kernel:
                         "metadata": {},
                         "status": msg["status"],
                     }
-                    #DEBUG
-                    print(reply_content)
                     self.send_response(socket_name, socket, "complete_reply", reply_content, parent_header=header, zmq_identities=zmq_identities)
                     break
 
@@ -1251,10 +1236,6 @@ class Kernel:
     # Function to handle info request 
     def handle_kernel_info_request(self, socket_name, socket, header, zmq_identities):
         self.send_response('iopub',None,'status',{'execution_state': 'busy'},parent_header=header)
-        # DEBUGGING
-        print("Handling kernel_info_request...")
-        print(f"Socket name: {socket_name}")
-        print(f"ZMQ Identities: {zmq_identities}")
         reply_content = {
             'status': 'ok',
             'protocol_version': '5.3', 
@@ -1273,8 +1254,6 @@ class Kernel:
                 {'text': 'MyJuliaKernel Documentation', 'url': 'https://github.com/samuel98t/Semester-Project-Jupyter-Kernel'}  # my github link
             ]
         }
-        # DEBUGGING
-        print("Sending kernel_info_reply...",zmq_identities)
         self.send_response(socket_name, socket, 'kernel_info_reply', reply_content, parent_header=header, zmq_identities=zmq_identities)
         self.send_iopub_status("idle", header)
 
