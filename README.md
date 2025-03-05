@@ -22,7 +22,7 @@ Use examples are in the Testing.ipynb notebook.
 - Install Requirments
 - pip install -r requirements.txt
 Now to install the kernel:
-- jupyter kernelspec install kernel_dir --name=my_kernel
+- jupyter kernelspec install --user my_kernel (where {my_kernel} is the folder containing the my_kernel.py and kernel.json NAME)
 - verify with jupyter kernelspec list
 - Now open jupyter notebook by typing jupyter notebook in the terminal.
 - Create a notebook and select the newly installed kernel .
