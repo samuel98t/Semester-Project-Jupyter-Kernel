@@ -26,3 +26,5 @@ Now to install the kernel:
 - verify with jupyter kernelspec list
 - Now open jupyter notebook by typing jupyter notebook in the terminal.
 - Create a notebook and select the newly installed kernel .
+
+  ### FOR EXAMPLES CHECK Testing.ipynb
