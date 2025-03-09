@@ -1,6 +1,15 @@
 ### A Python / Julia Dual Kernel.
-A jupyter notebook kernel made for an easy quick mix of both julia and python in the same jupyter notebook, julia interactions made possible by the use of juliacall . and kernel communcation with the front-end made possible by the use of zmq .
 
+This is a Semester Project that was done under the supervision of Roi Poranne as required for a BSC in computer science in the University of Haifa.
+
+It started as a Matlab kernel project , but after disscussions in the meeting i landed on a a Dual Julia Python kernel instead, Julia instead of Matlab due it being open source and popular,
+and it being 2 languages to make the project more challenging/ more of a learning experince with an previously unknown to me lanauge.
+during the meetings we discussed kernels , the required communcation channels between the kernel and the frontend,
+aswell as using current Jupyter kernel/communcation documentation and IPython kernel and its documentation as a guide,and then deciding to use magics to switch between the languages in cells.
+and at the end Finding a way to move variables from one langauage to another to make use of the dual kernel funcionality .
+
+### About :
+A jupyter notebook kernel made for an easy quick mix of both julia and python in the same jupyter notebook, julia interactions made possible by the use of juliacall . and kernel communcation with the front-end made possible by the use of zmq .
 ### Features :
 - Dual language support by using the correct magics at the top of the cell. (**%python**/**%julia**)
 - Inline prints/errors (stdout/stderr) in the notebook.
